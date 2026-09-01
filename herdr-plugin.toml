@@ -1,0 +1,34 @@
+id = "lancodev.jump"
+name = "Jump"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Two-pane fuzzy switcher for herdr workspaces and agents, with vim keys"
+platforms = ["macos", "linux"]
+
+# Invoke from a keybinding:
+#
+#   [[keys.command]]
+#   key = "prefix+g"
+#   type = "plugin_action"
+#   command = "lancodev.jump.open"
+#   description = "jump to a workspace or agent"
+#
+# Freeing prefix+g means unbinding herdr's own session navigator:
+#
+#   [keys]
+#   goto = ""
+
+[[actions]]
+id = "open"
+title = "Jump to a workspace or agent"
+contexts = ["workspace"]
+command = ["/bin/sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/jump\" open"]
+
+# Sized here as the fallback; the open action overrides it from config.toml.
+[[panes]]
+id = "picker"
+title = "jump"
+placement = "popup"
+width = "90%"
+height = "60%"
+command = ["/bin/sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/jump\" picker"]

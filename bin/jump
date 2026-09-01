@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+
+# jump — two-pane workspace/agent switcher for herdr.
+#
+# herdr's session navigator (keys.goto) is one tree of every workspace, tab and
+# pane, and it cannot be scoped: it re-expands every workspace on each open, so
+# collapsing a row with Space never survives. This is two panes instead —
+# workspaces on the left, agents on the right — with vim keys to move within a
+# pane or swap between them.
+#
+# Subcommands (all normally invoked by herdr, not by hand):
+#   jump open          action entrypoint: open the picker popup
+#   jump picker        pane entrypoint: the picker itself
+#   jump --key NAME    internal: emit fzf actions for a modal keybind
+#
+# Requires: fzf >= 0.54, jq.
+
+set -euo pipefail
+
+# herdr injects HERDR_BIN_PATH into every plugin command. The socket API docs
+# prefer the CLI wrappers over raw socket calls, and the CLI resolves the
+# session socket itself, so this works in named and remote sessions too.
+HERDR="${HERDR_BIN_PATH:-herdr}"
+PLUGIN_ID="${HERDR_PLUGIN_ID:-lancodev.jump}"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+CONFIG_FILE="${HERDR_PLUGIN_CONFIG_DIR:+$HERDR_PLUGIN_CONFIG_DIR/config.toml}"
+
+# Read a flat `key = value` entry from the user's plugin config, else default.
+cfg() {
+  local key="$1" fallback="$2" line
+  if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
+    line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE" 2>/dev/null | tail -1)" || true
+    if [[ -n "$line" ]]; then
+      line="${line#*=}"
+      line="${line%%\#*}"
+      line="$(printf '%s' "$line" | tr -d '"'"'"' \t\r')"
+      if [[ -n "$line" ]]; then
+        printf '%s' "$line"
+        return
+      fi
+    fi
+  fi
+  printf '%s' "$fallback"
+}
+
+# Bare printable keys are only bound in normal mode; search mode unbinds them so
+# they type into the query instead.
+NAV_KEYS='j,k,g,G,q,h,l,/'
+
+# ANSI palette rather than fixed hex, so the status glyphs inherit whatever
+# terminal theme the user runs. Mapping mirrors herdr's own state_icon().
+C_RESET=$'\e[0m'
+C_BLOCKED=$'\e[31m'
+C_WORKING=$'\e[33m'
+C_DONE=$'\e[36m'
+C_IDLE=$'\e[32m'
+C_DIM=$'\e[90m'
+
+#######################################################
+# MODAL KEYBIND ACTIONS
+#######################################################
+# fzf keeps no state of its own, so it is read back out of what fzf exports to
+# these transform() calls: FZF_LIST_LABEL names the active pane, and FZF_PROMPT
+# is "❯ " in normal mode or "/ " in search mode.
+
+current_pane() {
+  case "${FZF_LIST_LABEL:-}" in
+  *agents*) echo "agents" ;;
+  *) echo "workspaces" ;;
+  esac
+}
+
+searching() {
+  [[ "${FZF_PROMPT:-}" == /* ]]
+}
+
+other_pane() {
+  if [[ "$1" == "workspaces" ]]; then echo "agents"; else echo "workspaces"; fi
+}
+
+# Workspaces always render on the left and agents always on the right, so
+# swapping panes also swaps which side the preview window sits on.
+pane_side() {
+  if [[ "$1" == "workspaces" ]]; then echo "right"; else echo "left"; fi
+}
+
+activate_pane() {
+  local pane="$1" other side position
+  other="$(other_pane "$pane")"
+  side="$(pane_side "$pane")"
+  position="$(cat "$PICKER_DIR/pos.$pane")"
+
+  # clear-query re-matches asynchronously, so without the wait barrier
+  # disable-search freezes the list on the previous query's results.
+  #
+  # reload-sync rather than reload: pos() has to run against the new list, and
+  # only the sync form blocks until that list is in place.
+  printf "clear-query+wait+disable-search+rebind(%s)+change-prompt(❯ )" "$NAV_KEYS"
+  printf "+reload-sync(cat '%s')+change-list-label( %s )" "$PICKER_DIR/rows.$pane" "$pane"
+  printf "+change-preview(cat '%s')+change-preview-label( %s )" "$PICKER_DIR/panel.$other" "$other"
+  printf "+change-preview-window(%s,50%%,border-rounded)+pos(%s)" "$side" "$position"
+}
+
+cmd_key() {
+  : "${PICKER_DIR:?--key is only callable from inside the picker}"
+  local pane
+  pane="$(current_pane)"
+
+  case "${1:-}" in
+  workspaces | agents)
+    [[ "$1" == "$pane" ]] || activate_pane "$1"
+    ;;
+  toggle)
+    activate_pane "$(other_pane "$pane")"
+    ;;
+  search)
+    searching || printf "unbind(%s)+enable-search+clear-query+change-prompt(/ )" "$NAV_KEYS"
+    ;;
+  escape)
+    if searching; then
+      # wait barrier for the same reason as activate_pane.
+      printf "rebind(%s)+clear-query+wait+disable-search+change-prompt(❯ )" "$NAV_KEYS"
+    else
+      printf "abort"
+    fi
+    ;;
+  *)
+    echo "unknown jump key: ${1:-}" >&2
+    return 1
+    ;;
+  esac
+}
+
+#######################################################
+# ACTION ENTRYPOINT
+#######################################################
+
+cmd_open() {
+  "$HERDR" plugin pane open \
+    --plugin "$PLUGIN_ID" \
+    --entrypoint picker \
+    --placement popup \
+    --width "$(cfg width '90%')" \
+    --height "$(cfg height '60%')" \
+    --focus >/dev/null
+}
+
+#######################################################
+# PANE ENTRYPOINT
+#######################################################
+
+build_rows() {
+  local workspaces_json agents_json pane
+
+  workspaces_json="$("$HERDR" workspace list)"
+  agents_json="$("$HERDR" agent list)"
+
+  local jq_icon='
+    def icon:
+      if   . == "blocked" then $blocked + "●"
+      elif . == "working" then $working + "●"
+      elif . == "done"    then $finished + "●"
+      elif . == "idle"    then $idle + "○"
+      else $dim + "·" end + $reset;
+    def here: if . then "▸" else " " end;
+  '
+
+  render() {
+    jq -r \
+      --arg reset "$C_RESET" \
+      --arg blocked "$C_BLOCKED" \
+      --arg working "$C_WORKING" \
+      --arg finished "$C_DONE" \
+      --arg idle "$C_IDLE" \
+      --arg dim "$C_DIM" \
+      "$@"
+  }
+
+  # Rows are "<pane>\t<focus target>\t<rendered label>"; fzf shows field 3
+  # onward via --with-nth, so the target rides along hidden from display and
+  # from search.
+  render "$jq_icon"'
+    .result.workspaces[]
+    | "workspaces\t\(.workspace_id)\t\(.focused | here) \(.number)  \(.agent_status | icon)  \(.label)  \($dim)\(.pane_count) pane\(if .pane_count == 1 then "" else "s" end)\($reset)"
+  ' <<<"$workspaces_json" >"$PICKER_DIR/rows.workspaces"
+
+  # Agents carry a workspace_id but no workspace label, and they arrive in
+  # terminal order, so join against the workspace list to label and sort them.
+  render --argjson ws "$workspaces_json" "$jq_icon"'
+    ($ws.result.workspaces | map({key: .workspace_id, value: .}) | from_entries) as $by_id
+    | .result.agents
+    | map(. + {
+        _order: ($by_id[.workspace_id].number // 9999),
+        _space: ($by_id[.workspace_id].label // .workspace_id)
+      })
+    | sort_by(._order, .pane_id)
+    | .[]
+    | "agents\t\(.pane_id)\t\(.focused | here) \(.agent_status | icon)  \(._space)  \($dim)\(.agent) › \(.terminal_title_stripped)\($reset)"
+  ' <<<"$agents_json" >"$PICKER_DIR/rows.agents"
+
+  for pane in workspaces agents; do
+    # The inactive pane is rendered into fzf's preview window, which has no
+    # --with-nth of its own, so it gets the same rows with the hidden fields cut.
+    cut -f3- <"$PICKER_DIR/rows.$pane" >"$PICKER_DIR/panel.$pane"
+
+    if [[ ! -s "$PICKER_DIR/panel.$pane" ]]; then
+      printf '%s  no %s%s\n' "$C_DIM" "$pane" "$C_RESET" >"$PICKER_DIR/panel.$pane"
+      # An empty focus target makes Enter a no-op rather than an error.
+      printf '%s\t\t%s  no %s%s\n' "$pane" "$C_DIM" "$pane" "$C_RESET" >"$PICKER_DIR/rows.$pane"
+    fi
+
+    # 1-based row of whatever is focused now, so each pane opens on the cursor
+    # instead of snapping to the top.
+    grep -n $'\t▸' "$PICKER_DIR/rows.$pane" | head -1 | cut -d: -f1 >"$PICKER_DIR/pos.$pane" || true
+    [[ -s "$PICKER_DIR/pos.$pane" ]] || echo 1 >"$PICKER_DIR/pos.$pane"
+  done
+}
+
+cmd_picker() {
+  local tool
+  for tool in "$HERDR" fzf jq; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "jump: $tool not found on PATH" >&2
+      read -rsn 1 -p "press any key to close"
+      return 1
+    fi
+  done
+
+  local tmp start other side colors selection pane target
+  tmp="${TMPDIR:-/tmp}"
+  PICKER_DIR="$(mktemp -d "${tmp%/}/herdr-jump.XXXXXX")"
+  export PICKER_DIR
+  trap 'rm -rf "$PICKER_DIR"' EXIT
+
+  build_rows
+
+  start="$(cfg start_pane workspaces)"
+  [[ "$start" == "agents" ]] || start="workspaces"
+  other="$(other_pane "$start")"
+  side="$(pane_side "$start")"
+
+  # Only the accent-carrying elements are overridden; everything else stays on
+  # fzf's own defaults or the terminal background so the popup inherits the
+  # user's theme.
+  colors="bg:-1,gutter:-1,fg:-1,hl:$(cfg accent 6),hl+:$(cfg accent 6)"
+  colors+=",pointer:$(cfg accent 6),prompt:$(cfg accent 6),label:$(cfg accent 6)"
+  colors+=",border:$(cfg dim 8),header:$(cfg dim 8),info:$(cfg dim 8)"
+
+  # Esc or ctrl-c leaves fzf non-zero; that is a cancel, not a failure.
+  selection="$(fzf \
+    --ansi \
+    --delimiter=$'\t' \
+    --with-nth='3..' \
+    --layout=reverse \
+    --info=hidden \
+    --no-separator \
+    --no-multi \
+    --cycle \
+    --disabled \
+    --height='100%' \
+    --border=none \
+    --margin=0 \
+    --padding='0,1' \
+    --prompt='❯ ' \
+    --pointer='❯' \
+    --gutter=' ' \
+    --header='j/k move · / filter · h/l·tab pane · ⏎ jump · q quit' \
+    --color="$colors" \
+    --list-border=rounded \
+    --list-label=" $start " \
+    --preview="cat '$PICKER_DIR/panel.$other'" \
+    --preview-window="$side,50%,border-rounded" \
+    --preview-label=" $other " \
+    --bind="load:pos($(cat "$PICKER_DIR/pos.$start"))+unbind(load)" \
+    --bind='j:down,k:up,ctrl-n:down,ctrl-p:up' \
+    --bind='ctrl-d:half-page-down,ctrl-u:half-page-up' \
+    --bind='g:first,G:last,q:abort' \
+    --bind="h:transform('$SELF' --key workspaces)" \
+    --bind="l:transform('$SELF' --key agents)" \
+    --bind="tab:transform('$SELF' --key toggle)" \
+    --bind="/:transform('$SELF' --key search)" \
+    --bind="esc:transform('$SELF' --key escape)" \
+    <"$PICKER_DIR/rows.$start")" || return 0
+
+  IFS=$'\t' read -r pane target _ <<<"$selection"
+  [[ -n "${target:-}" ]] || return 0
+
+  local focus=()
+  case "$pane" in
+  workspaces) focus=(workspace focus "$target") ;;
+  agents) focus=(agent focus "$target") ;;
+  *) return 0 ;;
+  esac
+
+  # The popup closes the moment this command exits, so a failure has to hold
+  # the screen or the error scrolls past before it can be read.
+  local response message
+  if ! response="$("$HERDR" "${focus[@]}" 2>&1)"; then
+    message="$(jq -r '.error.message // empty' <<<"$response" 2>/dev/null || true)"
+    echo "jump: ${message:-$response}" >&2
+    read -rsn 1 -p "press any key to close"
+    return 1
+  fi
+}
+
+case "${1:-}" in
+open) cmd_open ;;
+picker) cmd_picker ;;
+--key) cmd_key "${2:-}" ;;
+*)
+  echo "usage: jump <open|picker>" >&2
+  exit 1
+  ;;
+esac
