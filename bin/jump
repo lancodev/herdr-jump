@@ -6,14 +6,14 @@
 # pane, and it cannot be scoped: it re-expands every workspace on each open, so
 # collapsing a row with Space never survives. This is two panes instead —
 # workspaces on the left, agents on the right — with vim keys to move within a
-# pane or swap between them.
+# pane, swap between them, or reorder the workspaces themselves.
 #
 # Subcommands (all normally invoked by herdr, not by hand):
 #   jump open          action entrypoint: open the picker popup
 #   jump picker        pane entrypoint: the picker itself
 #   jump --key NAME    internal: emit fzf actions for a modal keybind
 #
-# Requires: fzf >= 0.54, jq.
+# Requires: fzf >= 0.54, jq. Reordering also needs nc or socat.
 
 set -euo pipefail
 
@@ -24,6 +24,14 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 PLUGIN_ID="${HERDR_PLUGIN_ID:-lancodev.jump}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 CONFIG_FILE="${HERDR_PLUGIN_CONFIG_DIR:+$HERDR_PLUGIN_CONFIG_DIR/config.toml}"
+
+# Everything else here goes through the CLI, but herdr 0.8.2 ships no wrapper
+# for workspace.move, so reordering is the one call that has to speak the socket
+# protocol itself. herdr injects HERDR_SOCKET_PATH into every plugin process;
+# the fallback covers the default session if it ever arrives unset. Only the
+# Unix domain form is handled, which the macos/linux manifest already limits us
+# to — Windows would need the named pipe form instead.
+SOCKET="${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}"
 
 # Read a flat `key = value` entry from the user's plugin config, else default.
 cfg() {
@@ -45,7 +53,7 @@ cfg() {
 
 # Bare printable keys are only bound in normal mode; search mode unbinds them so
 # they type into the query instead.
-NAV_KEYS='j,k,g,G,q,h,l,/'
+NAV_KEYS='j,k,J,K,g,G,q,h,l,/'
 
 # ANSI palette rather than fixed hex, so the status glyphs inherit whatever
 # terminal theme the user runs. Mapping mirrors herdr's own state_icon().
@@ -84,6 +92,16 @@ pane_side() {
   if [[ "$1" == "workspaces" ]]; then echo "right"; else echo "left"; fi
 }
 
+# Reordering only applies to workspaces, so the hint is swapped along with the
+# pane rather than advertising a key that does nothing on the agents side.
+header_for() {
+  local keys='j/k move'
+  if [[ "$1" == "workspaces" ]] && reorder_supported; then
+    keys+=' · J/K reorder'
+  fi
+  printf '%s · / filter · h/l·tab pane · ⏎ jump · q quit' "$keys"
+}
+
 activate_pane() {
   local pane="$1" other side position
   other="$(other_pane "$pane")"
@@ -99,6 +117,7 @@ activate_pane() {
   printf "+reload-sync(cat '%s')+change-list-label( %s )" "$PICKER_DIR/rows.$pane" "$pane"
   printf "+change-preview(cat '%s')+change-preview-label( %s )" "$PICKER_DIR/panel.$other" "$other"
   printf "+change-preview-window(%s,50%%,border-rounded)+pos(%s)" "$side" "$position"
+  printf "+change-header(%s)" "$(header_for "$pane")"
 }
 
 cmd_key() {
@@ -124,11 +143,94 @@ cmd_key() {
       printf "abort"
     fi
     ;;
+  move-up | move-down)
+    cmd_move "${1#move-}" "${2:-}"
+    ;;
   *)
     echo "unknown jump key: ${1:-}" >&2
     return 1
     ;;
   esac
+}
+
+#######################################################
+# WORKSPACE REORDERING
+#######################################################
+
+# Reordering is optional; without a socket to talk to the picker still jumps,
+# and header_for() drops the hint so the key is never advertised.
+reorder_supported() {
+  [[ -S "$SOCKET" ]] || return 1
+  command -v socat >/dev/null 2>&1 || command -v nc >/dev/null 2>&1
+}
+
+# One newline-delimited JSON request in, one response line out.
+socket_send() {
+  if command -v socat >/dev/null 2>&1; then
+    printf '%s\n' "$1" | socat -t2 - "UNIX-CONNECT:$SOCKET" 2>/dev/null
+  else
+    printf '%s\n' "$1" | nc -w 2 -U "$SOCKET" 2>/dev/null
+  fi
+}
+
+# insert_index is resolved against the list *including* the moved workspace, so
+# it means "sit in front of whatever is at this index right now". Moving up is
+# therefore at-1, but moving down is at+2: at+1 is the workspace's own slot and
+# would be a no-op. at+2 == length is valid and appends to the end.
+#
+# Returns non-zero when nothing moved — already at that end of the list, or the
+# server refused — so the caller can leave the list untouched.
+move_workspace() {
+  local workspace_id="$1" direction="$2" insert_index response
+
+  # Re-read the order instead of trusting the popup's snapshot: insert_index is
+  # positional, so a list that shifted under us would reorder the wrong row.
+  insert_index="$("$HERDR" workspace list | jq -r \
+    --arg id "$workspace_id" --arg dir "$direction" '
+      .result.workspaces as $ws
+      | ($ws | length) as $len
+      | ($ws | map(.workspace_id) | index($id)) as $at
+      | if   $at == null    then empty
+        elif $dir == "up"   then (if $at == 0 then empty else $at - 1 end)
+        else                     (if $at >= $len - 1 then empty else $at + 2 end)
+        end')"
+
+  [[ -n "$insert_index" ]] || return 1
+
+  response="$(socket_send "$(jq -nc \
+    --arg id "$workspace_id" --argjson at "$insert_index" \
+    '{ id: "jump-move", method: "workspace.move",
+       params: { workspace_id: $id, insert_index: $at } }')")"
+
+  # A raw socket call reports refusal in the payload, not the exit status, so
+  # insist on a result rather than merely the absence of an error: an empty or
+  # unparseable reply then reads as failure too.
+  [[ -n "$response" ]] && jq -e 'has("result")' <<<"$response" >/dev/null 2>&1
+}
+
+# fzf hands over the highlighted row's workspace id; the list is rebuilt in
+# place and the cursor follows the row that moved.
+cmd_move() {
+  local direction="$1" workspace_id="$2" position
+
+  reorder_supported || return 0
+  [[ "$(current_pane)" == "workspaces" ]] || return 0
+  [[ -n "$workspace_id" ]] || return 0
+  move_workspace "$workspace_id" "$direction" || return 0
+
+  build_rows
+  position="$(awk -F'\t' -v id="$workspace_id" '$2 == id { print NR; exit }' \
+    "$PICKER_DIR/rows.workspaces")"
+  [[ -n "$position" ]] || position=1
+
+  # Remember it as the pane's cursor as well, so toggling over to agents and
+  # back returns to the row that moved rather than to the focused workspace.
+  printf '%s\n' "$position" >"$PICKER_DIR/pos.workspaces"
+
+  # refresh-preview because agents sort by workspace order, so the panel behind
+  # the preview window has just been rewritten too.
+  printf "reload-sync(cat '%s')+pos(%s)+refresh-preview" \
+    "$PICKER_DIR/rows.workspaces" "$position"
 }
 
 #######################################################
@@ -264,7 +366,7 @@ cmd_picker() {
     --prompt='❯ ' \
     --pointer='❯' \
     --gutter=' ' \
-    --header='j/k move · / filter · h/l·tab pane · ⏎ jump · q quit' \
+    --header="$(header_for "$start")" \
     --color="$colors" \
     --list-border=rounded \
     --list-label=" $start " \
@@ -278,6 +380,8 @@ cmd_picker() {
     --bind="h:transform('$SELF' --key workspaces)" \
     --bind="l:transform('$SELF' --key agents)" \
     --bind="tab:transform('$SELF' --key toggle)" \
+    --bind="K:transform('$SELF' --key move-up {2})" \
+    --bind="J:transform('$SELF' --key move-down {2})" \
     --bind="/:transform('$SELF' --key search)" \
     --bind="esc:transform('$SELF' --key escape)" \
     <"$PICKER_DIR/rows.$start")" || return 0
@@ -306,7 +410,7 @@ cmd_picker() {
 case "${1:-}" in
 open) cmd_open ;;
 picker) cmd_picker ;;
---key) cmd_key "${2:-}" ;;
+--key) cmd_key "${2:-}" "${3:-}" ;;
 *)
   echo "usage: jump <open|picker>" >&2
   exit 1

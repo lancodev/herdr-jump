@@ -1,8 +1,8 @@
 # Jump for herdr
 
 A two-pane fuzzy switcher for [herdr](https://herdr.dev): **workspaces on the
-left, agents on the right**, vim keys to move within a pane or swap between
-them.
+left, agents on the right**, vim keys to move within a pane, swap between them,
+or reorder your workspaces.
 
 herdr's built-in session navigator is one tree of every workspace, tab and
 pane. It cannot be scoped — it re-expands every workspace each time it opens,
@@ -12,7 +12,7 @@ alternative: pick a workspace, or cross over and pick an agent directly.
 ```
 ╭──────────── workspaces ─────────────╮╭─────────────── agents ────────────────╮
 │ ❯                                   ││   ●  dotfiles  opencode › OC | Limit… │
-│   j/k move · / filter · h/l·tab …   ││   ●  api  claude › refactor billing   │
+│   j/k move · J/K reorder · / filt…  ││   ●  api  claude › refactor billing   │
 │     1  ●  dotfiles           1 pane ││ ▸ ○  web  opencode › fix scroll bug   │
 │     2  ●  api               2 panes ││                                       │
 │ ❯ ▸ 3  ○  web                1 pane ││                                       │
@@ -22,12 +22,17 @@ alternative: pick a workspace, or cross over and pick an agent directly.
 - Both panes are always visible; <kbd>h</kbd>/<kbd>l</kbd>/<kbd>Tab</kbd> move focus between them
 - Each pane opens on whatever is currently focused, so <kbd>⏎</kbd> is a no-op and <kbd>j</kbd><kbd>⏎</kbd> is the next workspace
 - Selecting an agent jumps workspace, tab and pane in one hop
+- <kbd>J</kbd>/<kbd>K</kbd> reorders the highlighted workspace without leaving the picker
 - Status glyphs mirror herdr's own sidebar and inherit your terminal theme
 
 ## Requirements
 
 [`fzf`](https://github.com/junegunn/fzf) 0.54+ and [`jq`](https://jqlang.org),
 both on `PATH`.
+
+Reordering also needs `nc` or `socat`, because herdr ships no CLI wrapper for
+`workspace.move` and the call has to go to the socket directly. Without either
+one the picker still switches normally and simply drops the reorder key.
 
 ## Install
 
@@ -68,12 +73,20 @@ Jump starts in normal mode, like herdr's navigator: bare keys are commands,
 | <kbd>ctrl-d</kbd> <kbd>ctrl-u</kbd> | half page |
 | <kbd>g</kbd> <kbd>G</kbd> | first / last |
 | <kbd>h</kbd> <kbd>l</kbd> <kbd>Tab</kbd> | swap pane |
+| <kbd>J</kbd> <kbd>K</kbd> | reorder the highlighted workspace |
 | <kbd>/</kbd> | filter; <kbd>Esc</kbd> returns to normal mode |
 | <kbd>⏎</kbd> | jump to the selection |
 | <kbd>q</kbd> <kbd>Esc</kbd> | close |
 
 In filter mode the bare keys type normally, so searching for `jq` or `agent`
 works as expected.
+
+<kbd>J</kbd>/<kbd>K</kbd> move the row the cursor is on, which is not
+necessarily the focused workspace, and the cursor rides along with it. The order
+is herdr's own, so it persists after the popup closes and renumbers the
+workspaces everywhere. The agents pane is a view of that same order rather than
+a list of its own, so it re-sorts as you go; there is nothing to reorder from
+that side.
 
 ## Configure
 
