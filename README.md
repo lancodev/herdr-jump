@@ -16,18 +16,25 @@ alternative: pick a workspace, or cross over and pick an agent directly.
 │     1  ●  dotfiles           1 pane ││ ▸ ○  web  opencode › fix scroll bug   │
 │     2  ●  api               2 panes ││                                       │
 │ ❯ ▸ 3  ○  web                1 pane ││                                       │
+╰─────────────────────────────────────╯│                                       │
+╭─────────────── preview ─────────────╮│                                       │
+│  web · 2 tabs · 3 panes · idle      ││                                       │
+│  ~/src/web                          ││                                       │
+│    1 · nvim            [unknown]    ││                                       │
+│    2 · opencode › fix… [idle]       ││                                       │
 ╰─────────────────────────────────────╯╰───────────────────────────────────────╯
 ```
 
 - Both panes are always visible; <kbd>h</kbd>/<kbd>l</kbd>/<kbd>Tab</kbd> move focus between them
 - Each pane opens on whatever is currently focused, so <kbd>⏎</kbd> is a no-op and <kbd>j</kbd><kbd>⏎</kbd> is the next workspace
 - Selecting an agent jumps workspace, tab and pane in one hop
+- A preview pane under the active list describes the highlighted row
 - Status glyphs mirror herdr's own sidebar and inherit your terminal theme
 
 ## Requirements
 
-[`fzf`](https://github.com/junegunn/fzf) 0.54+ and [`jq`](https://jqlang.org),
-both on `PATH`.
+[`fzf`](https://github.com/junegunn/fzf) 0.65+ (for footer support) and
+[`jq`](https://jqlang.org), both on `PATH`.
 
 ## Install
 
@@ -88,6 +95,20 @@ height = "60%"
 # Which pane is active when the picker opens: "workspaces" or "agents".
 start_pane = "workspaces"
 
+# What the preview pane shows for the highlighted row.
+#   "detail" — workspace: tabs and their states, cwd, counts
+#              agent: full untruncated title, kind, state, pane id, cwd
+#   "output" — a live tail of that pane's terminal, in its real colors
+#   "off"    — no preview pane
+#
+# "output" is the better read for shells, editors and logs. For a full-screen
+# TUI agent the bottom of the screen is its input box, so you mostly get the
+# prompt border and status line rather than what it is working on.
+preview = "detail"
+
+# Height of the preview pane, in lines.
+preview_lines = 8
+
 # fzf colors for the accent (pointer, prompt, labels, match highlights) and for
 # borders and the header. ANSI index, 256-color index, or hex.
 accent = 6
@@ -96,8 +117,9 @@ dim = 8
 
 ## Notes
 
-- The list is a snapshot taken when the popup opens, not a live view. It is a
-  switcher you are in for a second, not a dashboard.
+- The lists are a snapshot taken when the popup opens, not a live view. It is a
+  switcher you are in for a second, not a dashboard. The preview pane is read
+  fresh per selection.
 - Agents come from `herdr agent list`, so anything herdr detects or that
   reports through an [integration](https://herdr.dev/docs/integrations/) shows
   up — no per-agent configuration here.
