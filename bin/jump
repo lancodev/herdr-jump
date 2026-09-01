@@ -12,9 +12,8 @@
 #   jump open          action entrypoint: open the picker popup
 #   jump picker        pane entrypoint: the picker itself
 #   jump --key NAME    internal: emit fzf actions for a modal keybind
-#   jump --detail ...  internal: render the footer preview for a row
 #
-# Requires: fzf >= 0.65 (footer support), jq.
+# Requires: fzf >= 0.54, jq.
 
 set -euo pipefail
 
@@ -86,15 +85,10 @@ pane_side() {
 }
 
 activate_pane() {
-  local pane="$1" other side position preview_on=1
+  local pane="$1" other side position
   other="$(other_pane "$pane")"
   side="$(pane_side "$pane")"
   position="$(cat "$PICKER_DIR/pos.$pane")"
-  [[ "$(cfg preview detail)" != "off" ]] || preview_on=0
-
-  # Recorded before any action is emitted so that the stale footer calls this
-  # swap provokes can recognise themselves as stale. See cmd_detail.
-  ((preview_on)) && echo "$pane" >"$PICKER_DIR/active"
 
   # clear-query re-matches asynchronously, so without the wait barrier
   # disable-search freezes the list on the previous query's results.
@@ -105,18 +99,6 @@ activate_pane() {
   printf "+reload-sync(cat '%s')+change-list-label( %s )" "$PICKER_DIR/rows.$pane" "$pane"
   printf "+change-preview(cat '%s')+change-preview-label( %s )" "$PICKER_DIR/panel.$other" "$other"
   printf "+change-preview-window(%s,50%%,border-rounded)+pos(%s)" "$side" "$position"
-
-  # Drive the footer explicitly rather than leaning on focus. It cannot use
-  # {1}/{2}/{3}: fzf substitutes placeholders when it parses this action list,
-  # which is before pos() has moved the cursor. The destination row is known
-  # already, so read it out of the rows file and pass literal ids instead.
-  if ((preview_on)); then
-    local row kind focus_target preview_pane
-    row="$(sed -n "${position}p" "$PICKER_DIR/rows.$pane")"
-    IFS=$'\t' read -r kind focus_target preview_pane _ <<<"$row"
-    printf "+bg-transform-footer('%s' --detail '%s' '%s' '%s')" \
-      "$SELF" "$kind" "$focus_target" "$preview_pane"
-  fi
 }
 
 cmd_key() {
@@ -150,101 +132,6 @@ cmd_key() {
 }
 
 #######################################################
-# FOOTER PREVIEW
-#######################################################
-# Rendered by a bg-transform-footer bind on fzf's focus event, so it refreshes
-# per selection without blocking j/k. Always emits exactly preview_lines lines:
-# a footer that grows and shrinks with its content makes the layout jump.
-
-pad_lines() {
-  local want="$1" seen=0 line
-  while IFS= read -r line; do
-    printf '%s%s\n' "$line" "$C_RESET"
-    seen=$((seen + 1))
-    [[ $seen -lt $want ]] || return 0
-  done
-  while [[ $seen -lt $want ]]; do
-    echo
-    seen=$((seen + 1))
-  done
-}
-
-# `pane read --format ansi` emits SGR colour runs and nothing else — no cursor
-# moves or erases — so it renders safely in fzf's footer once the bare carriage
-# returns are dropped; left in, each one would slide the cursor back to column
-# zero and overwrite the line. The read is already windowed to the last `lines`
-# rows, so pad_lines only makes up the difference for a shorter pane.
-preview_output() {
-  local target="$1" lines="$2"
-  "$HERDR" pane read "$target" --lines "$lines" --format ansi --source recent 2>/dev/null |
-    tr -d '\r'
-}
-
-preview_detail() {
-  local kind="$1" focus_target="$2" preview_pane="$3"
-  local info
-
-  if [[ "$kind" == "agents" ]]; then
-    info="$("$HERDR" agent get "$focus_target" 2>/dev/null)" || return 0
-    jq -r --arg dim "$C_DIM" --arg reset "$C_RESET" '
-      .result.agent
-      | "\(.agent)  \($dim)·\($reset)  \(.agent_status)  \($dim)·\($reset)  \(.pane_id)",
-        "\($dim)\(.cwd)\($reset)",
-        "\(.terminal_title_stripped // "")"
-    ' <<<"$info" 2>/dev/null
-    return 0
-  fi
-
-  info="$("$HERDR" workspace get "$focus_target" 2>/dev/null)" || return 0
-  jq -r --arg dim "$C_DIM" --arg reset "$C_RESET" '
-    .result.workspace
-    | "\(.label)  \($dim)·\($reset)  \(.tab_count) tab\(if .tab_count == 1 then "" else "s" end)  \($dim)·\($reset)  \(.pane_count) pane\(if .pane_count == 1 then "" else "s" end)  \($dim)·\($reset)  \(.agent_status)"
-  ' <<<"$info" 2>/dev/null
-
-  if [[ -n "$preview_pane" ]]; then
-    "$HERDR" pane get "$preview_pane" 2>/dev/null |
-      jq -r --arg dim "$C_DIM" --arg reset "$C_RESET" '"\($dim)\(.result.pane.cwd)\($reset)"' 2>/dev/null
-  fi
-
-  "$HERDR" tab list 2>/dev/null |
-    jq -r --arg ws "$focus_target" --arg dim "$C_DIM" --arg reset "$C_RESET" '
-      .result.tabs[] | select(.workspace_id == $ws)
-      | "  \(.label)  \($dim)[\(.agent_status)]\($reset)"
-    ' 2>/dev/null
-}
-
-cmd_detail() {
-  local kind="${1:-}" focus_target="${2:-}" preview_pane="${3:-}"
-  local mode lines active row
-  mode="$(cfg preview detail)"
-  lines="$(cfg preview_lines 8)"
-
-  [[ "$mode" == "off" ]] && return 0
-
-  # A pane swap makes fzf fire focus against the list being replaced, so calls
-  # can arrive describing a row from the pane just left. They run in the
-  # background alongside the correct call and can finish after it, so rather
-  # than dropping them — which would race to a blank footer — they are
-  # redirected onto the row that is genuinely selected now.
-  local dir="${PICKER_DIR:-}"
-  active="$([[ -n "$dir" ]] && cat "$dir/active" 2>/dev/null || true)"
-  if [[ -n "$active" && "$kind" != "$active" ]]; then
-    row="$(sed -n "$(cat "$dir/pos.$active")p" "$dir/rows.$active" 2>/dev/null || true)"
-    IFS=$'\t' read -r kind focus_target preview_pane _ <<<"$row"
-  fi
-
-  [[ -n "$focus_target" ]] || { pad_lines "$lines" </dev/null; return 0; }
-
-  if [[ "$mode" == "detail" ]]; then
-    preview_detail "$kind" "$focus_target" "$preview_pane" | pad_lines "$lines"
-  elif [[ -n "$preview_pane" ]]; then
-    preview_output "$preview_pane" "$lines" | pad_lines "$lines"
-  else
-    pad_lines "$lines" </dev/null
-  fi
-}
-
-#######################################################
 # ACTION ENTRYPOINT
 #######################################################
 
@@ -263,13 +150,10 @@ cmd_open() {
 #######################################################
 
 build_rows() {
-  local workspaces_json agents_json panes_json pane
+  local workspaces_json agents_json pane
 
   workspaces_json="$("$HERDR" workspace list)"
   agents_json="$("$HERDR" agent list)"
-  # Only needed to resolve each workspace to the pane the footer should preview:
-  # workspace.list gives the active tab, pane.list maps that tab to a pane.
-  panes_json="$("$HERDR" pane list)"
 
   local jq_icon='
     def icon:
@@ -292,13 +176,12 @@ build_rows() {
       "$@"
   }
 
-  # Rows are "<pane>\t<focus target>\t<preview pane>\t<rendered label>"; fzf
-  # shows field 4 onward via --with-nth, so the ids ride along hidden from
-  # display and from search while staying available to {1}/{2}/{3} in binds.
-  render --argjson panes "$panes_json" "$jq_icon"'
-    ($panes.result.panes | group_by(.tab_id) | map({key: .[0].tab_id, value: .[0].pane_id}) | from_entries) as $pane_by_tab
-    | .result.workspaces[]
-    | "workspaces\t\(.workspace_id)\t\($pane_by_tab[.active_tab_id] // "")\t\(.focused | here) \(.number)  \(.agent_status | icon)  \(.label)  \($dim)\(.pane_count) pane\(if .pane_count == 1 then "" else "s" end)\($reset)"
+  # Rows are "<pane>\t<focus target>\t<rendered label>"; fzf shows field 3
+  # onward via --with-nth, so the target rides along hidden from display and
+  # from search.
+  render "$jq_icon"'
+    .result.workspaces[]
+    | "workspaces\t\(.workspace_id)\t\(.focused | here) \(.number)  \(.agent_status | icon)  \(.label)  \($dim)\(.pane_count) pane\(if .pane_count == 1 then "" else "s" end)\($reset)"
   ' <<<"$workspaces_json" >"$PICKER_DIR/rows.workspaces"
 
   # Agents carry a workspace_id but no workspace label, and they arrive in
@@ -312,18 +195,18 @@ build_rows() {
       })
     | sort_by(._order, .pane_id)
     | .[]
-    | "agents\t\(.pane_id)\t\(.pane_id)\t\(.focused | here) \(.agent_status | icon)  \(._space)  \($dim)\(.agent) › \(.terminal_title_stripped)\($reset)"
+    | "agents\t\(.pane_id)\t\(.focused | here) \(.agent_status | icon)  \(._space)  \($dim)\(.agent) › \(.terminal_title_stripped)\($reset)"
   ' <<<"$agents_json" >"$PICKER_DIR/rows.agents"
 
   for pane in workspaces agents; do
     # The inactive pane is rendered into fzf's preview window, which has no
     # --with-nth of its own, so it gets the same rows with the hidden fields cut.
-    cut -f4- <"$PICKER_DIR/rows.$pane" >"$PICKER_DIR/panel.$pane"
+    cut -f3- <"$PICKER_DIR/rows.$pane" >"$PICKER_DIR/panel.$pane"
 
     if [[ ! -s "$PICKER_DIR/panel.$pane" ]]; then
       printf '%s  no %s%s\n' "$C_DIM" "$pane" "$C_RESET" >"$PICKER_DIR/panel.$pane"
       # An empty focus target makes Enter a no-op rather than an error.
-      printf '%s\t\t\t%s  no %s%s\n' "$pane" "$C_DIM" "$pane" "$C_RESET" >"$PICKER_DIR/rows.$pane"
+      printf '%s\t\t%s  no %s%s\n' "$pane" "$C_DIM" "$pane" "$C_RESET" >"$PICKER_DIR/rows.$pane"
     fi
 
     # 1-based row of whatever is focused now, so each pane opens on the cursor
@@ -355,7 +238,6 @@ cmd_picker() {
   [[ "$start" == "agents" ]] || start="workspaces"
   other="$(other_pane "$start")"
   side="$(pane_side "$start")"
-  echo "$start" >"$PICKER_DIR/active"
 
   # Only the accent-carrying elements are overridden; everything else stays on
   # fzf's own defaults or the terminal background so the popup inherits the
@@ -363,28 +245,12 @@ cmd_picker() {
   colors="bg:-1,gutter:-1,fg:-1,hl:$(cfg accent 6),hl+:$(cfg accent 6)"
   colors+=",pointer:$(cfg accent 6),prompt:$(cfg accent 6),label:$(cfg accent 6)"
   colors+=",border:$(cfg dim 8),header:$(cfg dim 8),info:$(cfg dim 8)"
-  colors+=",footer:-1,footer-border:$(cfg dim 8)"
-
-  # bg-transform-footer rather than transform-footer: the plain form is
-  # synchronous and would stall j/k on every herdr call.
-  #
-  # focus only fires on cursor movement, so the same transform is chained onto
-  # load as well or the footer sits empty until the first keypress.
-  local footer_opts=() footer_action=""
-  if [[ "$(cfg preview detail)" != "off" ]]; then
-    footer_action="+bg-transform-footer('$SELF' --detail {1} {2} {3})"
-    footer_opts=(
-      --footer-border=rounded
-      --footer-label=' preview '
-      --bind="focus:bg-transform-footer('$SELF' --detail {1} {2} {3})"
-    )
-  fi
 
   # Esc or ctrl-c leaves fzf non-zero; that is a cancel, not a failure.
   selection="$(fzf \
     --ansi \
     --delimiter=$'\t' \
-    --with-nth='4..' \
+    --with-nth='3..' \
     --layout=reverse \
     --info=hidden \
     --no-separator \
@@ -405,8 +271,7 @@ cmd_picker() {
     --preview="cat '$PICKER_DIR/panel.$other'" \
     --preview-window="$side,50%,border-rounded" \
     --preview-label=" $other " \
-    "${footer_opts[@]}" \
-    --bind="load:pos($(cat "$PICKER_DIR/pos.$start"))$footer_action+unbind(load)" \
+    --bind="load:pos($(cat "$PICKER_DIR/pos.$start"))+unbind(load)" \
     --bind='j:down,k:up,ctrl-n:down,ctrl-p:up' \
     --bind='ctrl-d:half-page-down,ctrl-u:half-page-up' \
     --bind='g:first,G:last,q:abort' \
@@ -417,7 +282,7 @@ cmd_picker() {
     --bind="esc:transform('$SELF' --key escape)" \
     <"$PICKER_DIR/rows.$start")" || return 0
 
-  IFS=$'\t' read -r pane target _preview _ <<<"$selection"
+  IFS=$'\t' read -r pane target _ <<<"$selection"
   [[ -n "${target:-}" ]] || return 0
 
   local focus=()
@@ -442,7 +307,6 @@ case "${1:-}" in
 open) cmd_open ;;
 picker) cmd_picker ;;
 --key) cmd_key "${2:-}" ;;
---detail) cmd_detail "${2:-}" "${3:-}" "${4:-}" ;;
 *)
   echo "usage: jump <open|picker>" >&2
   exit 1
