@@ -30,9 +30,11 @@ alternative: pick a workspace, or cross over and pick an agent directly.
 [`fzf`](https://github.com/junegunn/fzf) 0.54+ and [`jq`](https://jqlang.org),
 both on `PATH`.
 
-Reordering also needs `nc` or `socat`, because herdr ships no CLI wrapper for
-`workspace.move` and the call has to go to the socket directly. Without either
-one the picker still switches normally and simply drops the reorder key.
+`nc` or `socat` is optional. herdr ships no CLI wrapper for `workspace.move`
+or for focusing a pane by id, so those two calls go to the socket directly.
+Without either tool the picker still switches normally; it drops the reorder
+key, and an agent sharing a split tab lands on that tab's own focused pane
+rather than the agent's.
 
 ## Install
 
@@ -116,6 +118,11 @@ dim = 8
   up — no per-agent configuration here.
 - The popup is session-modal, so opening it while Settings or Copy mode is
   active returns `ui_busy`. Close the other modal first.
+- herdr 0.9.0 lets attached clients view different workspaces and tabs, but
+  its `agent.focus` stopped reaching the client that asked, so a jump landed
+  nowhere. Jump composes the hop from `tab.focus` and `pane.focus` instead,
+  which still broadcast. That does mean a jump moves every attached client, the
+  same as herdr's own `workspace.focus`.
 
 ## License
 

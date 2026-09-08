@@ -96,7 +96,7 @@ pane_side() {
 # pane rather than advertising a key that does nothing on the agents side.
 header_for() {
   local keys='j/k move'
-  if [[ "$1" == "workspaces" ]] && reorder_supported; then
+  if [[ "$1" == "workspaces" ]] && socket_available; then
     keys+=' · J/K reorder'
   fi
   printf '%s · / filter · h/l·tab pane · ⏎ jump · q quit' "$keys"
@@ -154,12 +154,13 @@ cmd_key() {
 }
 
 #######################################################
-# WORKSPACE REORDERING
+# SOCKET
 #######################################################
+# The socket is optional. Without it the picker still switches; it only loses
+# workspace reordering (header_for() drops the hint so the key is never
+# advertised) and, in a split tab, landing on the agent's exact pane.
 
-# Reordering is optional; without a socket to talk to the picker still jumps,
-# and header_for() drops the hint so the key is never advertised.
-reorder_supported() {
+socket_available() {
   [[ -S "$SOCKET" ]] || return 1
   command -v socat >/dev/null 2>&1 || command -v nc >/dev/null 2>&1
 }
@@ -172,6 +173,52 @@ socket_send() {
     printf '%s\n' "$1" | nc -w 2 -U "$SOCKET" 2>/dev/null
   fi
 }
+
+#######################################################
+# JUMPING
+#######################################################
+
+# herdr 0.9.0 made focus per-client, and agent.focus stopped reaching the
+# client: the server records the new focus, but the popup closes on the same
+# screen it opened over. tab.focus and pane.focus still broadcast, so the agent
+# hop is composed from those instead — the tab through the CLI, which already
+# switches workspace, tab and that tab's own pane, then the exact pane over the
+# socket when one is reachable, for agents sharing a split with something else.
+#
+# Output and exit status are the caller's error surface: anything printed on
+# failure is shown before the popup closes.
+focus_agent() {
+  local pane_id="$1" info tab_id
+
+  info="$("$HERDR" agent get "$pane_id" 2>&1)" || {
+    printf '%s\n' "$info"
+    return 1
+  }
+  tab_id="$(jq -r '.result.agent.tab_id // empty' <<<"$info" 2>/dev/null)"
+  if [[ -z "$tab_id" ]]; then
+    printf '%s\n' "$info"
+    return 1
+  fi
+
+  "$HERDR" tab focus "$tab_id" >/dev/null || return 1
+
+  if socket_available; then
+    socket_send "$(jq -nc --arg id "$pane_id" \
+      '{ id: "jump-pane", method: "pane.focus", params: { pane_id: $id } }')" \
+      >/dev/null
+  fi
+}
+
+jump_to() {
+  case "$1" in
+  workspaces) "$HERDR" workspace focus "$2" ;;
+  agents) focus_agent "$2" ;;
+  esac
+}
+
+#######################################################
+# WORKSPACE REORDERING
+#######################################################
 
 # insert_index is resolved against the list *including* the moved workspace, so
 # it means "sit in front of whatever is at this index right now". Moving up is
@@ -213,7 +260,7 @@ move_workspace() {
 cmd_move() {
   local direction="$1" workspace_id="$2" position
 
-  reorder_supported || return 0
+  socket_available || return 0
   [[ "$(current_pane)" == "workspaces" ]] || return 0
   [[ -n "$workspace_id" ]] || return 0
   move_workspace "$workspace_id" "$direction" || return 0
@@ -388,18 +435,12 @@ cmd_picker() {
 
   IFS=$'\t' read -r pane target _ <<<"$selection"
   [[ -n "${target:-}" ]] || return 0
-
-  local focus=()
-  case "$pane" in
-  workspaces) focus=(workspace focus "$target") ;;
-  agents) focus=(agent focus "$target") ;;
-  *) return 0 ;;
-  esac
+  [[ "$pane" == "workspaces" || "$pane" == "agents" ]] || return 0
 
   # The popup closes the moment this command exits, so a failure has to hold
   # the screen or the error scrolls past before it can be read.
   local response message
-  if ! response="$("$HERDR" "${focus[@]}" 2>&1)"; then
+  if ! response="$(jump_to "$pane" "$target" 2>&1)"; then
     message="$(jq -r '.error.message // empty' <<<"$response" 2>/dev/null || true)"
     echo "jump: ${message:-$response}" >&2
     read -rsn 1 -p "press any key to close"
