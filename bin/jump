@@ -92,6 +92,16 @@ pane_side() {
   if [[ "$1" == "workspaces" ]]; then echo "right"; else echo "left"; fi
 }
 
+# Status glyph legend, colored the same way build_rows() colors the rows. The
+# glyphs apply to both panes, so it rides on the outer border below them rather
+# than in either pane's header. Words are dimmed explicitly: labels take the
+# accent color, and a bare reset would hand the words back to it.
+legend() {
+  printf ' %s●%s blocked · %s●%s working · %s●%s done · %s○%s idle%s ' \
+    "$C_BLOCKED" "$C_DIM" "$C_WORKING" "$C_DIM" \
+    "$C_DONE" "$C_DIM" "$C_IDLE" "$C_DIM" "$C_RESET"
+}
+
 # Reordering only applies to workspaces, so the hint is swapped along with the
 # pane rather than advertising a key that does nothing on the agents side.
 header_for() {
@@ -407,7 +417,9 @@ cmd_picker() {
     --cycle \
     --disabled \
     --height='100%' \
-    --border=none \
+    --border=bottom \
+    --border-label="$(legend)" \
+    --border-label-pos=2:bottom \
     --margin=0 \
     --padding='0,1' \
     --prompt='❯ ' \

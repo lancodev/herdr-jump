@@ -1,6 +1,6 @@
 id = "lancodev.jump"
 name = "Jump"
-version = "0.3.1"
+version = "0.4.0"
 min_herdr_version = "0.8.0"
 description = "Two-pane fuzzy switcher for herdr workspaces and agents, with vim keys and workspace reordering"
 platforms = ["macos", "linux"]

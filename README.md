@@ -23,7 +23,24 @@ alternative: pick a workspace, or cross over and pick an agent directly.
 - Each pane opens on whatever is currently focused, so <kbd>⏎</kbd> is a no-op and <kbd>j</kbd><kbd>⏎</kbd> is the next workspace
 - Selecting an agent jumps workspace, tab and pane in one hop
 - <kbd>J</kbd>/<kbd>K</kbd> reorders the highlighted workspace without leaving the picker
-- Status glyphs mirror herdr's own sidebar and inherit your terminal theme
+- Status glyphs mirror herdr's own sidebar and inherit your terminal theme; a
+  legend runs along the bottom edge, under both panes
+
+## Status glyphs
+
+Each row carries the agent status herdr reports, in the same colors as its
+sidebar:
+
+| Glyph | Status |
+|---|---|
+| red `●` | blocked — the agent is waiting on you (a permission prompt, a question) |
+| yellow `●` | working |
+| cyan `●` | done — finished and not yet looked at |
+| green `○` | idle |
+| dim `·` | no agent, or a status herdr does not know |
+
+Workspaces show the rolled-up status of the agents inside them. `▸` marks
+whatever is focused right now.
 
 ## Requirements
 
