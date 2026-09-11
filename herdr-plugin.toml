@@ -1,8 +1,8 @@
 id = "lancodev.jump"
 name = "Jump"
-version = "0.4.0"
+version = "0.5.0"
 min_herdr_version = "0.8.0"
-description = "Two-pane fuzzy switcher for herdr workspaces and agents, with vim keys and workspace reordering"
+description = "Two-pane workspace and agent switcher with filtering, history, previews, and workspace management"
 platforms = ["macos", "linux"]
 
 # Invoke from a keybinding:

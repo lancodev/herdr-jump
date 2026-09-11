@@ -13,7 +13,8 @@
 #   jump picker        pane entrypoint: the picker itself
 #   jump --key NAME    internal: emit fzf actions for a modal keybind
 #
-# Requires: fzf >= 0.54, jq. Reordering also needs nc or socat.
+# Requires: fzf >= 0.74.0 (the `wait` bind action), jq. Reordering also needs
+# socat, or a `nc` build with Unix-socket support (`-U`).
 
 set -euo pipefail
 
@@ -22,7 +23,6 @@ set -euo pipefail
 # session socket itself, so this works in named and remote sessions too.
 HERDR="${HERDR_BIN_PATH:-herdr}"
 PLUGIN_ID="${HERDR_PLUGIN_ID:-lancodev.jump}"
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 CONFIG_FILE="${HERDR_PLUGIN_CONFIG_DIR:+$HERDR_PLUGIN_CONFIG_DIR/config.toml}"
 
 # Everything else here goes through the CLI, but herdr 0.8.2 ships no wrapper
@@ -33,6 +33,132 @@ CONFIG_FILE="${HERDR_PLUGIN_CONFIG_DIR:+$HERDR_PLUGIN_CONFIG_DIR/config.toml}"
 # to — Windows would need the named pipe form instead.
 SOCKET="${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}"
 
+#######################################################
+# STATE DIR
+#######################################################
+# Where jump keeps things that need to outlive one picker session: jump
+# history (for Ctrl-o and `order = "recent"`) and, when remember_query is on,
+# each pane's last query. Distinct from $PICKER_DIR (mktemp'd fresh per
+# picker invocation and removed on exit — see cmd_picker) and from
+# $CONFIG_FILE (user-edited, read-only to this script).
+#
+# herdr sets HERDR_PLUGIN_STATE_DIR on every plugin process for exactly this.
+# It is not covered by `herdr api schema --json` (that only documents the
+# socket API), but it is one of the env vars herdr's own binary embeds
+# alongside HERDR_PLUGIN_CONFIG_DIR/HERDR_PLUGIN_ROOT — confirmed by grepping
+# the installed `herdr` binary's strings. Falls back to
+# $HERDR_PLUGIN_CONFIG_DIR/state, then a tmp dir, for a manual/dev run where
+# neither is set.
+STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-${HERDR_PLUGIN_CONFIG_DIR:+$HERDR_PLUGIN_CONFIG_DIR/state}}"
+[[ -n "$STATE_DIR" ]] || STATE_DIR="${TMPDIR:-/tmp}/herdr-jump-state"
+
+# herdr's snapshot carries no session id or name today — checked against
+# `herdr api schema --json`'s SessionSnapshot definition, which has none —
+# so state files are namespaced by a hash of the session socket path
+# instead. Distinct herdr sessions always listen on distinct sockets (see
+# `herdr session list`), so this is equivalent in practice. cksum rather than
+# shasum/sha1sum: it is POSIX and present under the same name on both macOS
+# and Linux, where those two disagree on which of them ships.
+session_key() {
+  printf '%s' "$SOCKET" | cksum | awk '{print $1}'
+}
+
+# Each --key dispatch is a brand-new process re-running this whole file from
+# the top, so on the naive path every j/k keystroke pays for a fresh
+# session_key() (two subshelled `cksum` pipelines). cmd_picker exports the
+# result once the first time it computes it (JUMP_HISTORY_FILE/
+# JUMP_QUERY_PREFIX below); every later --key invocation inherits that
+# environment from the fzf process it was spawned by and skips straight to
+# using it, since the socket path — and so session_key()'s output — cannot
+# change mid-session.
+if [[ -n "${JUMP_HISTORY_FILE:-}" && -n "${JUMP_QUERY_PREFIX:-}" ]]; then
+  HISTORY_FILE="$JUMP_HISTORY_FILE"
+  QUERY_PREFIX="$JUMP_QUERY_PREFIX"
+else
+  HISTORY_FILE="$STATE_DIR/history.$(session_key)"
+  QUERY_PREFIX="$STATE_DIR/query.$(session_key)"
+fi
+
+# Single-quote a string for safe embedding in a POSIX shell command line
+# (escapes embedded quotes as '\''). Used for every path or variable this
+# script interpolates into an fzf execute/execute-silent/reload/transform
+# string, since those run through a shell fzf spawns — {n} placeholders don't
+# need this, fzf already quotes those itself (see the fzf man page's PLACEHOLDER
+# EXPRESSIONS section). A plain ${var//'/'\''} works on a modern bash but
+# bash 3.2 handles the backslashes in that replacement differently, so this
+# walks the string a character at a time instead — slower, but identical on
+# both.
+shq() {
+  local s="$1" out="'" i c
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    if [[ "$c" == "'" ]]; then
+      out="${out}'\\''"
+    else
+      out="${out}${c}"
+    fi
+  done
+  out="${out}'"
+  printf '%s' "$out"
+}
+
+# $SELF never changes after startup and is quoted the same way at every call
+# site, so it is escaped once here rather than on each use — and, same as
+# HISTORY_FILE/QUERY_PREFIX above, skipped entirely (SELF itself is not even
+# computed — dirname/pwd/basename never run) on a --key dispatch that already
+# inherited JUMP_SELF_Q from cmd_picker's own export, rather than
+# re-deriving a path that cannot have moved.
+if [[ -n "${JUMP_SELF_Q:-}" ]]; then
+  SELF_Q="$JUMP_SELF_Q"
+else
+  SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  SELF_Q="$(shq "$SELF")"
+fi
+
+# Strip a `# comment` from a config line, but only outside quotes — a bare
+# `line="${line%%\#*}"` would truncate `accent = "#39BAE6"` at the # inside
+# the string. Walked a character at a time for the same bash-3.2-portability
+# reason as shq().
+strip_comment() {
+  local s="$1" out="" i c q=""
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    if [[ -n "$q" ]]; then
+      out="${out}${c}"
+      [[ "$c" == "$q" ]] && q=""
+      continue
+    fi
+    if [[ "$c" == '"' || "$c" == "'" ]]; then
+      q="$c"
+      out="${out}${c}"
+      continue
+    fi
+    [[ "$c" == '#' ]] && break
+    out="${out}${c}"
+  done
+  printf '%s' "$out"
+}
+
+#######################################################
+# SETTINGS
+#######################################################
+# Every key cfg()/cfg_valid() reads from the user's config.toml, collected in
+# one place so a later phase can copy this straight into the README's
+# Configure section instead of re-deriving it from call sites scattered
+# through the rest of the file.
+#
+#   name            type      default        meaning
+#   width           size      "90%"          popup width (fzf SIZE: cells or a percentage)
+#   height          size      "60%"          popup height (fzf SIZE: cells or a percentage)
+#   start_pane      enum      "workspaces"   pane active when the picker opens: workspaces|agents
+#   pane_ratio      int       35             workspace pane percentage (20-60)
+#   accent          color     6              fzf accent color: pointer, prompt, labels, match highlights
+#   dim             color     8              fzf border/header/info color, and this script's own dim text
+#   order           enum      "workspace"    row order: "workspace" (herdr's own order) or "recent" (jump history first, unvisited rows fall back to workspace order)
+#   remember_query  bool      false          persist each pane's last query across picker opens
+#   search_first    bool      false          open the picker straight into search mode instead of normal mode
+#   preview         bool      true           show the other pane in the preview window; false renders the active pane full-width
+
 # Read a flat `key = value` entry from the user's plugin config, else default.
 cfg() {
   local key="$1" fallback="$2" line
@@ -40,8 +166,16 @@ cfg() {
     line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE" 2>/dev/null | tail -1)" || true
     if [[ -n "$line" ]]; then
       line="${line#*=}"
-      line="${line%%\#*}"
-      line="$(printf '%s' "$line" | tr -d '"'"'"' \t\r')"
+      line="$(strip_comment "$line")"
+      # Trim surrounding whitespace.
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      # Drop one matching pair of surrounding quotes, if there is one.
+      if ((${#line} >= 2)) &&
+        { [[ "${line:0:1}" == '"' && "${line: -1}" == '"' ]] ||
+          [[ "${line:0:1}" == "'" && "${line: -1}" == "'" ]]; }; then
+        line="${line:1:${#line}-2}"
+      fi
       if [[ -n "$line" ]]; then
         printf '%s' "$line"
         return
@@ -51,25 +185,248 @@ cfg() {
   printf '%s' "$fallback"
 }
 
-# Bare printable keys are only bound in normal mode; search mode unbinds them so
-# they type into the query instead.
-NAV_KEYS='j,k,J,K,g,G,q,h,l,/'
+# width/height accept an fzf SIZE: a bare integer (rows/cols) or a percentage.
+valid_dimension() {
+  [[ "$1" =~ ^[0-9]+%?$ ]]
+}
+
+valid_pane_ratio() {
+  [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 20 && 10#$1 <= 60))
+}
+
+valid_pane_name() {
+  [[ "$1" == "workspaces" || "$1" == "agents" ]]
+}
+
+valid_order() {
+  [[ "$1" == "workspace" || "$1" == "recent" ]]
+}
+
+# For the toml-flavored boolean settings (remember_query, search_first,
+# preview) — only the two literal words, same as cfg() would read out of a
+# bare `key = true` line in config.toml (no "1"/"0"/"yes" aliases).
+valid_bool() {
+  [[ "$1" == "true" || "$1" == "false" ]]
+}
+
+# Everything fzf's --color accepts for a single slot: a named ANSI color,
+# 0-255, or a #rrggbb truecolor spec. See the fzf man page's COLORS section.
+valid_color() {
+  case "$1" in
+  -1 | default | black | red | green | yellow | blue | magenta | cyan | white | \
+    bright-black | gray | grey | bright-red | bright-green | bright-yellow | \
+    bright-blue | bright-magenta | bright-cyan | bright-white)
+    return 0
+    ;;
+  esac
+  if [[ "$1" =~ ^[0-9]+$ ]]; then
+    ((10#$1 <= 255))
+    return
+  fi
+  [[ "$1" =~ ^#[0-9a-fA-F]{6}$ ]]
+}
+
+# cfg(), but the value is discarded (falling back to $2) unless $3 (a
+# predicate function name) accepts it — a typo'd or malformed config value
+# should never reach fzf as a broken option.
+#
+# Every --key dispatch is a fresh process, so left unguarded this means every
+# single keystroke re-greps config.toml for every setting it happens to touch
+# (activate_pane alone reads two). A picker session never edits its own
+# config.toml mid-flight, so cmd_picker's own freeze_settings() resolves and
+# exports each of the ten settings from the doc table above exactly once
+# (JUMP_CFG_* below); every later cfg_valid call for one of those ten keys —
+# from this process or any --key child — hits that cache instead of
+# re-reading the file. The case arms are the full list from that table; a
+# key not in it (there are none today) just always takes the slow path.
+#
+# The cache is only trusted once JUMP_CFG_FROZEN=1 (set by freeze_settings as
+# its very last step — see there): an *unfrozen* JUMP_CFG_<NAME> could just
+# as well be inherited from an untrusted external caller's own environment
+# (`JUMP_CFG_PANE_RATIO=99 herdr ...`, say) rather than from a picker
+# session's own trusted export, and honoring it here would hand that
+# caller's out-of-range or otherwise-invalid value straight to fzf/this
+# script without ever going through $validator. This is also exactly why
+# freeze_settings' own cfg_valid calls are safe despite running before
+# JUMP_CFG_FROZEN is set: unfrozen, every one of them takes the slow
+# cfg()+$validator path below regardless of what was already in the
+# environment, so the *values* it ends up exporting are always
+# freshly-validated ones — only the act of freezing afterward makes a
+# --key child trust them without re-validating.
+cfg_valid() {
+  local key="$1" fallback="$2" validator="$3" value envname=""
+  case "$key" in
+  width) envname=JUMP_CFG_WIDTH ;;
+  height) envname=JUMP_CFG_HEIGHT ;;
+  start_pane) envname=JUMP_CFG_START_PANE ;;
+  pane_ratio) envname=JUMP_CFG_PANE_RATIO ;;
+  accent) envname=JUMP_CFG_ACCENT ;;
+  dim) envname=JUMP_CFG_DIM ;;
+  order) envname=JUMP_CFG_ORDER ;;
+  remember_query) envname=JUMP_CFG_REMEMBER_QUERY ;;
+  search_first) envname=JUMP_CFG_SEARCH_FIRST ;;
+  preview) envname=JUMP_CFG_PREVIEW ;;
+  esac
+  if [[ -n "$envname" && "${JUMP_CFG_FROZEN:-}" == "1" && -n "${!envname+x}" ]]; then
+    printf '%s' "${!envname}"
+    return
+  fi
+  value="$(cfg "$key" "$fallback")"
+  if "$validator" "$value"; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+# Resolves and exports every setting (the doc table above), SELF_Q, and the
+# session-key paths exactly once for this picker session — called only from
+# cmd_picker, and factored out here (rather than left inline) so it can be
+# called on its own to check that its output is actually validated, without
+# needing a live fzf/picker session to do it. JUMP_CFG_FROZEN=1 is exported
+# last, deliberately after every cfg_valid call above it: see cfg_valid's own
+# doc comment for why that ordering is what makes each of those ten calls
+# ignore any same-named JUMP_CFG_* an external caller's environment already
+# had, rather than trust it unvalidated.
+freeze_settings() {
+  export JUMP_SELF_Q="$SELF_Q"
+  export JUMP_HISTORY_FILE="$HISTORY_FILE"
+  export JUMP_QUERY_PREFIX="$QUERY_PREFIX"
+  export JUMP_CFG_WIDTH="$(cfg_valid width '90%' valid_dimension)"
+  export JUMP_CFG_HEIGHT="$(cfg_valid height '60%' valid_dimension)"
+  export JUMP_CFG_START_PANE="$(cfg_valid start_pane workspaces valid_pane_name)"
+  export JUMP_CFG_PANE_RATIO="$(cfg_valid pane_ratio 35 valid_pane_ratio)"
+  export JUMP_CFG_ACCENT="$(cfg_valid accent 6 valid_color)"
+  export JUMP_CFG_DIM="$(cfg_valid dim 8 valid_color)"
+  export JUMP_CFG_ORDER="$(cfg_valid order workspace valid_order)"
+  export JUMP_CFG_REMEMBER_QUERY="$(cfg_valid remember_query false valid_bool)"
+  export JUMP_CFG_SEARCH_FIRST="$(cfg_valid search_first false valid_bool)"
+  export JUMP_CFG_PREVIEW="$(cfg_valid preview true valid_bool)"
+  export JUMP_CFG_FROZEN=1
+}
+
+# Translate an fzf color spec (already passed through valid_color) into the
+# equivalent raw ANSI SGR foreground sequence, for the handful of places this
+# script does its own ANSI coloring (render_rows, legend) rather than leaving
+# it to fzf's --color.
+ansi_fg() {
+  case "$1" in
+  -1 | default) printf '\e[39m' ;;
+  black) printf '\e[30m' ;;
+  red) printf '\e[31m' ;;
+  green) printf '\e[32m' ;;
+  yellow) printf '\e[33m' ;;
+  blue) printf '\e[34m' ;;
+  magenta) printf '\e[35m' ;;
+  cyan) printf '\e[36m' ;;
+  white) printf '\e[37m' ;;
+  bright-black | gray | grey) printf '\e[90m' ;;
+  bright-red) printf '\e[91m' ;;
+  bright-green) printf '\e[92m' ;;
+  bright-yellow) printf '\e[93m' ;;
+  bright-blue) printf '\e[94m' ;;
+  bright-magenta) printf '\e[95m' ;;
+  bright-cyan) printf '\e[96m' ;;
+  bright-white) printf '\e[97m' ;;
+  '#'??????) printf '\e[38;2;%d;%d;%dm' "$((16#${1:1:2}))" "$((16#${1:3:2}))" "$((16#${1:5:2}))" ;;
+  [0-9]*) printf '\e[38;5;%dm' "$1" ;;
+  *) printf '\e[90m' ;;
+  esac
+}
+
+# Bare printable keys are only bound in normal mode; search and the input
+# modes unbind them so they type into the query instead. s/w/?/1-9 are the
+# status-filter, scope-filter, help and workspace-number keys added in this
+# phase — all normal-mode-only, same as the rest of this list. `o` (toggle
+# the agents-pane output preview) joins them for the same reason.
+NAV_KEYS='j,k,J,K,g,G,q,h,l,/,r,a,d,y,n,s,w,o,?,1,2,3,4,5,6,7,8,9'
+
+# Input modes also park the keys that would move the cursor, swap panes, or
+# accept a different row than the one the action started on: cursor keys,
+# Shift-Tab (which still moves the cursor even with --no-multi), and every
+# mouse gesture that can move focus or fire the default double-click accept.
+INPUT_KEYS='ctrl-n,ctrl-p,ctrl-j,ctrl-k,ctrl-d,up,down,pgup,pgdn,tab,shift-tab'
+INPUT_KEYS+=',left-click,right-click,double-click,scroll-up,scroll-down'
+
+# Roughly a screenful: the agents-pane output preview (`o`) shows this many
+# trailing lines of the highlighted agent's terminal, the same way the list
+# preview fills the window rather than a fixed small snippet.
+AGENT_PREVIEW_LINES=40
 
 # ANSI palette rather than fixed hex, so the status glyphs inherit whatever
 # terminal theme the user runs. Mapping mirrors herdr's own state_icon().
+# C_DIM is the one color actually driven by the user's config (`dim`, the
+# same value used for fzf's own border/header/info) rather than fixed, since
+# it is what render_rows() and legend() use for de-emphasized text.
 C_RESET=$'\e[0m'
 C_BLOCKED=$'\e[31m'
 C_WORKING=$'\e[33m'
 C_DONE=$'\e[36m'
 C_IDLE=$'\e[32m'
-C_DIM=$'\e[90m'
+C_ACCENT="$(ansi_fg "$(cfg_valid accent 6 valid_color)")"
+C_DIM="$(ansi_fg "$(cfg_valid dim 8 valid_color)")"
+
+# Real floor is 0.74.0: activate_pane()'s pane-switch barrier relies on the
+# `wait` bind action, added in 0.74.0. --list-border (0.58.0) is covered by
+# the same floor.
+FZF_MIN_MAJOR=0
+FZF_MIN_MINOR=74
+FZF_MIN_PATCH=0
+
+# True when $1 (an `fzf --version` style string, e.g. "0.74.3 (homebrew)" or
+# "0.42.0-19-g1d1c3d0") is >= FZF_MIN_*. Each component is truncated at its
+# first non-digit rather than stripped of non-digits, so a dev build's commit
+# suffix on the patch component doesn't get glued onto the number.
+fzf_version_ok() {
+  local v="${1%% *}" major minor patch
+  IFS='.' read -r major minor patch <<<"$v"
+  major="${major%%[!0-9]*}"
+  minor="${minor%%[!0-9]*}"
+  patch="${patch%%[!0-9]*}"
+  major="${major:-0}"
+  minor="${minor:-0}"
+  patch="${patch:-0}"
+
+  if ((major > FZF_MIN_MAJOR)); then return 0; fi
+  if ((major < FZF_MIN_MAJOR)); then return 1; fi
+  if ((minor > FZF_MIN_MINOR)); then return 0; fi
+  if ((minor < FZF_MIN_MINOR)); then return 1; fi
+  ((patch >= FZF_MIN_PATCH))
+}
+
+# Every external tool this script cannot run without, checked up front so a
+# missing or too-old one reads as a sentence instead of a raw command-not-found
+# or a picker that opens and immediately misbehaves. Prints the reason (no
+# "jump:" prefix — callers already have their own way to surface it) and
+# returns non-zero; prints nothing and returns 0 when everything is fine.
+check_deps() {
+  if ! command -v "$HERDR" >/dev/null 2>&1; then
+    printf '%s not found on PATH' "$HERDR"
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'jq not found on PATH'
+    return 1
+  fi
+  if ! command -v fzf >/dev/null 2>&1; then
+    printf 'fzf not found on PATH'
+    return 1
+  fi
+  local raw
+  raw="$(fzf --version 2>/dev/null)" || raw=""
+  if ! fzf_version_ok "$raw"; then
+    printf 'fzf %s found, need >= %d.%d.%d (uses the `wait` bind action)' \
+      "${raw:-unknown}" "$FZF_MIN_MAJOR" "$FZF_MIN_MINOR" "$FZF_MIN_PATCH"
+    return 1
+  fi
+}
 
 #######################################################
 # MODAL KEYBIND ACTIONS
 #######################################################
 # fzf keeps no state of its own, so it is read back out of what fzf exports to
-# these transform() calls: FZF_LIST_LABEL names the active pane, and FZF_PROMPT
-# is "❯ " in normal mode or "/ " in search mode.
+# these transform() calls: FZF_LIST_LABEL names the active pane, and the prompt
+# glyph names the mode.
 
 current_pane() {
   case "${FZF_LIST_LABEL:-}" in
@@ -78,9 +435,23 @@ current_pane() {
   esac
 }
 
-searching() {
-  [[ "${FZF_PROMPT:-}" == /* ]]
+mode() {
+  case "${FZF_PROMPT:-}" in
+  /*) echo "search" ;;
+  ✎*) echo "rename" ;;
+  +*) echo "add" ;;
+  @*) echo "add_dir" ;;
+  ✕*) echo "confirm" ;;
+  *) echo "normal" ;;
+  esac
 }
+
+searching() { [[ "$(mode)" == "search" ]]; }
+adding_dir() { [[ "$(mode)" == "add_dir" ]]; }
+confirming() { [[ "$(mode)" == "confirm" ]]; }
+
+# Any mode that borrows the query line or waits on an answer.
+in_input() { [[ "$(mode)" != "normal" && "$(mode)" != "search" ]]; }
 
 other_pane() {
   if [[ "$1" == "workspaces" ]]; then echo "agents"; else echo "workspaces"; fi
@@ -92,42 +463,911 @@ pane_side() {
   if [[ "$1" == "workspaces" ]]; then echo "right"; else echo "left"; fi
 }
 
-# Status glyph legend, colored the same way build_rows() colors the rows. The
+# Rows carry hidden fields ahead of the rendered text: both panes hide the
+# focus target in field 2, and agent rows additionally hide tab_id,
+# workspace_id, tab number and tab label (for a later phase to render) in
+# fields 3-6. --with-nth is a single global option, so it has to be swapped
+# via change-with-nth whenever the active pane changes.
+display_field() {
+  if [[ "$1" == "agents" ]]; then echo 7; else echo 3; fi
+}
+
+with_nth_for() {
+  printf '%s..' "$(display_field "$1")"
+}
+
+# fzf only lets --nth/search see the fields --with-nth displays (see the fzf
+# man page's -n/--nth section: "fzf doesn't allow searching against the
+# hidden fields" once --with-nth is in play) — there is no way to make a
+# field searchable-but-invisible the way a plain --nth would on the raw row.
+# The status word is therefore appended, dimmed, at the end of the visible
+# text itself (see render_rows) so a free-text search for it has something to
+# match; cmd_status_filter's `s` cycle is the exact, non-fuzzy way to filter
+# by status and does not depend on this at all.
+next_status_filter() {
+  case "$1" in
+  all) echo blocked ;;
+  blocked) echo done ;;
+  done) echo working ;;
+  working) echo idle ;;
+  *) echo all ;;
+  esac
+}
+
+next_scope_filter() {
+  case "$1" in
+  all) echo current ;;
+  current) echo highlighted ;;
+  *) echo all ;;
+  esac
+}
+
+# The bracketed suffix on a pane's list-label reflecting its own active
+# status filter, plus (agents only) the workspace-scope filter.
+pane_label() {
+  local pane label status scope
+  pane="$1"
+  label="$pane"
+  status="$(cat "$PICKER_DIR/status_filter.$pane" 2>/dev/null || echo all)"
+  [[ "$status" == "all" ]] || label="$label [$status]"
+  if [[ "$pane" == "agents" ]]; then
+    scope="$(cat "$PICKER_DIR/scope_filter" 2>/dev/null || echo all)"
+    case "$scope" in
+    current) label="$label [cur]" ;;
+    highlighted) label="$label [hl]" ;;
+    esac
+  fi
+  printf '%s' "$label"
+}
+
+# Status glyph legend, colored the same way render_rows() colors the rows. The
 # glyphs apply to both panes, so it rides on the outer border below them rather
 # than in either pane's header. Words are dimmed explicitly: labels take the
 # accent color, and a bare reset would hand the words back to it.
 legend() {
-  printf ' %s●%s blocked · %s●%s working · %s●%s done · %s○%s idle%s ' \
-    "$C_BLOCKED" "$C_DIM" "$C_WORKING" "$C_DIM" \
-    "$C_DONE" "$C_DIM" "$C_IDLE" "$C_DIM" "$C_RESET"
+  local cols="${FZF_COLUMNS:-${COLUMNS:-}}"
+  if [[ -z "$cols" ]]; then
+    cols="$(tput cols 2>/dev/null || echo 100)"
+  fi
+
+  if ((cols < 90)); then
+    printf ' %s* %scur · %s●%s blk · %s●%s wrk · %s●%s done · %s○%s idle · %s·%s none%s ' \
+      "$C_ACCENT" "$C_DIM" \
+      "$C_BLOCKED" "$C_DIM" "$C_WORKING" "$C_DIM" \
+      "$C_DONE" "$C_DIM" "$C_IDLE" "$C_DIM" "$C_DIM" "$C_DIM" "$C_RESET"
+  else
+    printf ' %s*%s current · %s●%s blocked · %s●%s working · %s●%s done · %s○%s idle · %s·%s none%s ' \
+      "$C_ACCENT" "$C_DIM" \
+      "$C_BLOCKED" "$C_DIM" "$C_WORKING" "$C_DIM" \
+      "$C_DONE" "$C_DIM" "$C_IDLE" "$C_DIM" "$C_DIM" "$C_DIM" "$C_RESET"
+  fi
 }
 
-# Reordering only applies to workspaces, so the hint is swapped along with the
-# pane rather than advertising a key that does nothing on the agents side.
+# Terminal-width half of preview policy: true when the window is too narrow
+# for a side-by-side split, independent of whether `preview` itself is even
+# enabled (see preview_enabled() below). Centralized here since header_for,
+# activate_pane, cmd_picker and cmd_resize all used to duplicate the same
+# $FZF_COLUMNS/$COLUMNS/tput fallback chain and the same 100-column threshold
+# — one of them drifting from the others (or getting the fallback chain
+# subtly wrong) was exactly how #9's collapsed-layout bugs happened.
+preview_collapsed() {
+  local cols
+  cols="${FZF_COLUMNS:-${COLUMNS:-}}"
+  [[ -n "$cols" ]] || cols="$(tput cols 2>/dev/null || echo 100)"
+  ((cols < 100))
+}
+
+# The `preview` config setting on its own, independent of width: whether the
+# other-pane preview — and the help/output windows that borrow it, see
+# show_overlay_preview() — exist in this session at all. Kept separate from
+# preview_collapsed() because ?/o still work by force-showing the window even
+# when the *normal* preview is currently width-collapsed; only preview=false
+# actually disables them (see cmd_help/cmd_toggle_agent_preview).
+preview_enabled() {
+  [[ "$(cfg_valid preview true valid_bool)" == "true" ]]
+}
+
+# Whether the *normal* other-pane preview should actually be showing right
+# now: both config-enabled and not currently width-collapsed. What
+# activate_pane, cmd_picker and header_for all size the normal preview off.
+effective_preview() {
+  preview_enabled && ! preview_collapsed
+}
+
+# Mode-specific or default hints for the active header.
 header_for() {
-  local keys='j/k move'
-  if [[ "$1" == "workspaces" ]] && socket_available; then
-    keys+=' · J/K reorder'
+  local pane="$1" label=""
+  if preview_enabled && preview_collapsed; then
+    if [[ "$pane" == "workspaces" ]]; then
+      label="[Workspaces] "
+    else
+      label="[Agents] "
+    fi
   fi
-  printf '%s · / filter · h/l·tab pane · ⏎ jump · q quit' "$keys"
+  printf '%s/ search · Tab pane · ⏎ jump · ? help' "$label"
+}
+
+# fzf action arguments are delimited by any matching pair, so pick one the
+# text does not contain rather than trying to escape it.
+action() {
+  local name="$1" text="$2" pair open close
+  for pair in '()' '[]' '{}' '<>' '~~' '!!' '@@' '##' '%%' '||' ';;' '::'; do
+    open="${pair:0:1}" close="${pair:1:1}"
+    if [[ "$text" != *"$open"* && "$text" != *"$close"* ]]; then
+      printf '%s%s%s%s' "$name" "$open" "$text" "$close"
+      return
+    fi
+  done
+  printf '%s(%s)' "$name" "${text//[()]/}"
+}
+
+# Into an input mode: bare and cursor keys are parked, the prompt glyph marks
+# the mode, and the header explains what Enter and Esc do now.
+save_search_query() {
+  local pane query
+  pane="$1"
+  query="$2"
+  printf '%s' "$query" >"$PICKER_DIR/query.$pane"
+  if [[ "$(cfg_valid remember_query false valid_bool)" == "true" ]]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s' "$query" >"$QUERY_PREFIX.$pane"
+  fi
+}
+
+enter_input() {
+  local prompt header pane return_mode saved_query
+  prompt="$1"
+  header="$2"
+  pane="$(current_pane)"
+  return_mode="normal"
+  saved_query=""
+  if searching; then
+    return_mode="search"
+    saved_query="${FZF_QUERY:-}"
+    save_search_query "$pane" "$saved_query"
+  fi
+  printf '%s' "$return_mode" >"$PICKER_DIR/input_return_mode"
+  printf '%s' "$saved_query" >"$PICKER_DIR/input_saved_query"
+  printf 'normal' >"$PICKER_DIR/search_mode.$pane"
+  printf "unbind(%s,%s)+disable-search+%s" "$NAV_KEYS" "$INPUT_KEYS" "$(action change-prompt "$prompt")"
+  printf "+%s" "$(action change-header "$header")"
+}
+
+# Leave a mutation mode by restoring the exact search query and mode it
+# interrupted. This matters for F2, which is globally bound and can enter
+# rename while search is active; mutation text must never become pane search
+# state.
+leave_input() {
+  local pane return_mode saved_query
+  pane="$1"
+  return_mode="$(cat "$PICKER_DIR/input_return_mode" 2>/dev/null || echo normal)"
+  saved_query="$(cat "$PICKER_DIR/input_saved_query" 2>/dev/null || true)"
+  if [[ "$return_mode" == "search" ]]; then
+    printf 'search' >"$PICKER_DIR/search_mode.$pane"
+    printf "rebind(%s)+%s+%s+enable-search+wait" "$INPUT_KEYS" \
+      "$(action change-prompt '/ ')" "$(action change-query "$saved_query")"
+  else
+    printf 'normal' >"$PICKER_DIR/search_mode.$pane"
+    printf "rebind(%s,%s)+disable-search+clear-query+change-prompt(❯ )" "$NAV_KEYS" "$INPUT_KEYS"
+  fi
+  printf "+%s" "$(action change-header "$(header_for "$pane")")"
+}
+
+# Common tail shared by every action that rebuilds a pane's rows and wants
+# fzf to reload from them: marks the picker as mid-transition (see
+# cmd_load()/cmd_focus()'s own doc comments on that flag, which this sets for
+# the same reason every other reload does) and emits the reload-sync action
+# against $1's current rows file. $2, if given, is appended verbatim — a
+# plain "refresh-preview" for most callers, or "change-list-label(...)
+# +refresh-preview" for the two that also just changed their own filter
+# label. Consolidates what used to be five near-identical copies of this
+# exact three-line sequence (refresh_to, cmd_status_filter, cmd_scope_filter,
+# cmd_refresh, cmd_move).
+reload_pane_action() {
+  local pane="$1" extra="${2:-}"
+  : >"$PICKER_DIR/transitioning"
+  printf "reload-sync(cat %s)" "$(shq "$PICKER_DIR/rows.$pane")"
+  [[ -n "$extra" ]] && printf "+%s" "$extra"
+}
+
+# Rebuild the rows after a change. The pane's own cursor is pointed at the
+# target row (by id, so it survives reordering and re-sorting) or, when the
+# target is gone, at a 1-based fallback position; the persistent `load`
+# binding applies whichever one resolves once the new rows are in place — see
+# cmd_load(). The other pane is re-rendered as well, since agent rows carry
+# workspace labels and sort by workspace order.
+#
+# On a refresh failure the rows files are untouched (render_rows only ever
+# overwrites them once every one of its own jq passes actually succeeds —
+# see there), so skipping the reload here just leaves the previous list on
+# screen with an error in the header, rather than blanking it.
+#
+# Always the full refresh_snapshot() round trip, never render_rows() alone:
+# every caller of refresh_to (rename, add, close) just mutated server state,
+# so the cached snapshot is the one thing here that is actually stale.
+refresh_to() {
+  local pane="$1" target="$2" fallback="${3:-1}" build_error
+
+  if ! build_error="$(refresh_snapshot)"; then
+    printf "%s" "$(action change-header "refresh failed: $build_error")"
+    return 0
+  fi
+
+  if [[ -n "$target" ]]; then
+    printf '%s\n' "$target" >"$PICKER_DIR/cursor.$pane"
+  else
+    local count
+    count="$(wc -l <"$PICKER_DIR/rows.$pane" | tr -d ' ')"
+    ((fallback > count)) && fallback="$count"
+    ((fallback < 1)) && fallback=1
+    : >"$PICKER_DIR/cursor.$pane"
+    printf '%s\n' "$fallback" >"$PICKER_DIR/pos.$pane"
+  fi
+
+  reload_pane_action "$pane" "refresh-preview"
+}
+
+# The other-pane preview's own content+window actions for whichever pane is
+# about to become active ($1) — one policy shared by activate_pane's own
+# pane switch and by restore_pane_preview's "back to normal" branch (leaving
+# help or the agent output preview), rather than each independently
+# recomputing side/ratio_pct and duplicating the same
+# change-preview(...)+change-preview-window(...) shape (see #9/#11: this is
+# exactly the duplication that let the two drift out of sync). Hidden
+# outright when effective_preview() is false — config-disabled, or the
+# terminal is currently too narrow for a split — otherwise `cat`s $1's own
+# "other pane" panel at the side and ratio pane_side()/pane_ratio computes
+# for it.
+normal_preview_action() {
+  local pane="$1" other side ratio_pct
+  if ! effective_preview; then
+    printf "change-preview-window(hidden)"
+    return
+  fi
+  other="$(other_pane "$pane")"
+  side="$(pane_side "$pane")"
+  ratio_pct="$(cfg_valid pane_ratio 35 valid_pane_ratio)"
+  [[ "$pane" == "workspaces" ]] && ratio_pct=$((100 - ratio_pct))
+  printf "change-preview(cat %s)+change-preview-label( %s )+change-preview-window(%s,%d%%,border-rounded)" \
+    "$(shq "$PICKER_DIR/panel.$other")" "$(pane_label "$other")" "$side" "$ratio_pct"
 }
 
 activate_pane() {
-  local pane="$1" other side position
-  other="$(other_pane "$pane")"
-  side="$(pane_side "$pane")"
-  position="$(cat "$PICKER_DIR/pos.$pane")"
+  local pane saved_query source source_mode dest_mode
+  pane="$1"
+  source="$(current_pane)"
+  source_mode="normal"
+  if searching; then
+    source_mode="search"
+    save_search_query "$source" "${FZF_QUERY:-}"
+  fi
+  printf '%s' "$source_mode" >"$PICKER_DIR/search_mode.$source"
+  saved_query="$(cat "$PICKER_DIR/query.$pane" 2>/dev/null || true)"
+  dest_mode="$(cat "$PICKER_DIR/search_mode.$pane" 2>/dev/null || echo normal)"
 
-  # clear-query re-matches asynchronously, so without the wait barrier
-  # disable-search freezes the list on the previous query's results.
+  # A pane switch always leaves the agents-only output preview and the help
+  # window behind, whichever pane is being entered — each is re-armed fresh
+  # with `o`/`?` again, per their own doc comments. Without clearing
+  # help_active too (this used to only clear agent_preview_active), the very
+  # next `?` press would see the stale flag, think help was still showing
+  # (when activate_pane had already silently overwritten the window with the
+  # other pane's content below), and "close" it right back to the same
+  # content instead of actually opening help — the first `?` after any pane
+  # switch was effectively swallowed.
+  rm -f "$PICKER_DIR/agent_preview_active" "$PICKER_DIR/help_active"
+
+  # Entering agents with a non-default scope filter: re-render first, so "the
+  # highlighted workspace" reflects whatever is highlighted *now* rather than
+  # whatever it was the last time rows.agents was generated (plain cursor
+  # movement on the workspaces side does not itself trigger a rebuild).
+  # render_rows() only — a pane switch changes nothing on the server, so
+  # "the highlighted workspace" only ever needs re-deriving from
+  # cursor.workspaces against the snapshot already cached, never a fresh RPC.
+  # Best-effort: a failed refresh here just means stale data, not a wedged
+  # picker, so the error is swallowed rather than surfaced mid-switch.
+  if [[ "$pane" == "agents" ]]; then
+    local scope
+    scope="$(cat "$PICKER_DIR/scope_filter" 2>/dev/null || echo all)"
+    [[ "$scope" == "all" ]] || render_rows >/dev/null 2>&1 || true
+  fi
+
+  # change-query rather than clear-query, so a filter left running on this
+  # pane the last time it was active comes back rather than being wiped.
   #
-  # reload-sync rather than reload: pos() has to run against the new list, and
-  # only the sync form blocks until that list is in place.
-  printf "clear-query+wait+disable-search+rebind(%s)+change-prompt(❯ )" "$NAV_KEYS"
-  printf "+reload-sync(cat '%s')+change-list-label( %s )" "$PICKER_DIR/rows.$pane" "$pane"
-  printf "+change-preview(cat '%s')+change-preview-label( %s )" "$PICKER_DIR/panel.$other" "$other"
-  printf "+change-preview-window(%s,50%%,border-rounded)+pos(%s)" "$side" "$position"
+  # change-query still queues an async re-match even with search disabled, so
+  # without the wait barrier, disable-search freezes the list on the previous
+  # query's results.
+  #
+  # reload-sync rather than reload: the persistent `load` binding has to run
+  # against the new list, and only the sync form guarantees that list is in
+  # place by the time load fires.
+  : >"$PICKER_DIR/transitioning"
+  printf "disable-search+change-list-label( %s )+change-with-nth(%s)" \
+    "$(pane_label "$pane")" "$(with_nth_for "$pane")"
+  printf "+%s+wait+reload-sync(cat %s)" \
+    "$(action change-query "$saved_query")" "$(shq "$PICKER_DIR/rows.$pane")"
+  if [[ "$dest_mode" == "search" ]]; then
+    printf "+unbind(%s)+change-prompt(/ )+enable-search" "$NAV_KEYS"
+  else
+    printf "+rebind(%s)+change-prompt(❯ )" "$NAV_KEYS"
+  fi
+  printf "+%s" "$(normal_preview_action "$pane")"
   printf "+change-header(%s)" "$(header_for "$pane")"
+}
+
+# Bound to the `load` event, which fzf fires once the input stream (including
+# every reload/reload-sync triggered from here) has fully landed — see the
+# fzf man page's own `load:reload-sync(...)+unbind(load)` example. Left bound
+# permanently (never unbound) so every reload this script triggers restores
+# the pane's cursor the same way, instead of computing a position inline in
+# the same action chain as the reload-sync that produced the list it targets.
+cmd_load() {
+  local pane id position count query settle_id current_id
+  pane="$(current_pane)"
+  id="$(cat "$PICKER_DIR/cursor.$pane" 2>/dev/null || true)"
+  query=""
+  if [[ "$(cat "$PICKER_DIR/search_mode.$pane" 2>/dev/null || echo normal)" == "search" ]]; then
+    query="$(cat "$PICKER_DIR/query.$pane" 2>/dev/null || true)"
+  fi
+  current_id="${1:-}"
+
+  position=""
+  settle_id=""
+  if [[ -n "$id" ]]; then
+    position="$(fzf --filter="$query" --ansi --delimiter=$'\t' \
+      --with-nth="$(with_nth_for "$pane")" <"$PICKER_DIR/rows.$pane" 2>/dev/null \
+      | awk -F'\t' -v id="$id" '$2 == id { print NR; exit }')" || true
+    [[ -n "$position" ]] && settle_id="$id"
+  fi
+  if [[ -z "$position" ]]; then
+    position="$(cat "$PICKER_DIR/pos.$pane" 2>/dev/null || true)"
+    [[ -n "$position" ]] || position=1
+    count="${FZF_MATCH_COUNT:-}"
+    [[ "$count" =~ ^[0-9]+$ ]] || count="$(wc -l <"$PICKER_DIR/rows.$pane" | tr -d ' ')"
+    ((position > count)) && position="$count"
+    ((position < 1)) && position=1
+    if ((count > 0)); then
+      settle_id="$(fzf --filter="$query" --ansi --delimiter=$'\t' \
+        --with-nth="$(with_nth_for "$pane")" <"$PICKER_DIR/rows.$pane" 2>/dev/null \
+        | awk -F'\t' -v pos="$position" 'NR == pos { print $2; exit }')" || true
+    fi
+  fi
+
+  printf '%s\n' "$position" >"$PICKER_DIR/pos.$pane"
+  printf '%s' "$settle_id" >"$PICKER_DIR/settle_id"
+  if [[ -z "$settle_id" || "$current_id" == "$settle_id" ]]; then
+    rm -f "$PICKER_DIR/transitioning" "$PICKER_DIR/settle_id"
+  fi
+  printf 'pos(%s)' "$position"
+}
+
+# Bound to the `focus` event, which fires on every vertical cursor move (and
+# on a search re-match). Keeps each pane's own cursor id and query text
+# current as the user browses, so switching panes and back — or a reload
+# triggered by some other action — has something to restore to.
+#
+# When remember_query is on, the same query is mirrored to $QUERY_PREFIX.$pane
+# so it survives past this picker session too — see cmd_picker's own restore
+# of it on the next open. Read fresh from cfg on every focus event rather than
+# once, the same way every other per-keystroke setting lookup in this script
+# does; a picker session never toggles the setting mid-flight, so the repeat
+# cost is a config-file grep, not a real branch.
+cmd_focus() {
+  local pane target settle_id
+  pane="$(current_pane)"
+  target="${1:-}"
+  [[ -n "$target" ]] || return 0
+  # fzf can deliver a focus callback after the destination list label has
+  # changed but while its placeholder still comes from the old list. Never
+  # let an id that is not actually in this pane overwrite its saved cursor.
+  awk -F'\t' -v id="$target" '$2 == id { found=1; exit } END { exit !found }' \
+    "$PICKER_DIR/rows.$pane" || return 0
+  if [[ -f "$PICKER_DIR/transitioning" ]]; then
+    settle_id="$(cat "$PICKER_DIR/settle_id" 2>/dev/null || true)"
+    [[ -n "$settle_id" && "$target" == "$settle_id" ]] || return 0
+    rm -f "$PICKER_DIR/transitioning" "$PICKER_DIR/settle_id"
+  fi
+  in_input && return 0
+  printf '%s\n' "$target" >"$PICKER_DIR/cursor.$pane"
+  [[ "${FZF_POS:-}" =~ ^[0-9]+$ ]] && printf '%s\n' "$FZF_POS" >"$PICKER_DIR/pos.$pane"
+}
+
+# Unlike focus, change fires for every query edit even when the highlighted
+# item stays put. Only search mode owns pane query state; rename/add input is
+# deliberately excluded.
+cmd_query() {
+  local pane
+  [[ -f "$PICKER_DIR/transitioning" ]] && return 0
+  searching || return 0
+  pane="$(current_pane)"
+  save_search_query "$pane" "${FZF_QUERY:-}"
+  printf 'search' >"$PICKER_DIR/search_mode.$pane"
+}
+
+# `s`: cycle this pane's own status filter and re-render. all -> blocked ->
+# done -> working -> idle -> all. Filtering happens inside render_rows()
+# itself (a jq select() against the already-cached snapshot) — no new API
+# call, and the exact match it does is not subject to fuzzy-search false
+# positives the way typing the word into `/` search would be. render_rows()
+# alone, never refresh_snapshot(): cycling a filter changes nothing on the
+# server, only which of the rows already rendered from the cached snapshot
+# get shown.
+cmd_status_filter() {
+  local pane cur next build_error
+  pane="$(current_pane)"
+  in_input && return 0
+
+  cur="$(cat "$PICKER_DIR/status_filter.$pane" 2>/dev/null || echo all)"
+  next="$(next_status_filter "$cur")"
+  printf '%s\n' "$next" >"$PICKER_DIR/status_filter.$pane"
+
+  if ! build_error="$(render_rows)"; then
+    printf "%s" "$(action change-header "refresh failed: $build_error")"
+    return 0
+  fi
+
+  reload_pane_action "$pane" "change-list-label( $(pane_label "$pane") )+refresh-preview"
+}
+
+# `w`: agents-only. all -> current workspace -> highlighted workspace -> all.
+# render_rows() only, same reasoning as cmd_status_filter above.
+cmd_scope_filter() {
+  local pane cur next build_error
+  pane="$(current_pane)"
+  in_input && return 0
+  [[ "$pane" == "agents" ]] || return 0
+
+  cur="$(cat "$PICKER_DIR/scope_filter" 2>/dev/null || echo all)"
+  next="$(next_scope_filter "$cur")"
+  printf '%s\n' "$next" >"$PICKER_DIR/scope_filter"
+
+  if ! build_error="$(render_rows)"; then
+    printf "%s" "$(action change-header "refresh failed: $build_error")"
+    return 0
+  fi
+
+  reload_pane_action agents "change-list-label( $(pane_label agents) )+refresh-preview"
+}
+
+# Ctrl-r: one fresh snapshot, both panes rebuilt, active filters and queries
+# untouched (they live in their own state files render_rows never writes to
+# except to seed them once on the very first build). The persistent `load`
+# binding restores the cursor by id the same way any other reload does.
+cmd_refresh() {
+  local pane build_error
+  pane="$(current_pane)"
+  in_input && return 0
+
+  if ! build_error="$(refresh_snapshot)"; then
+    printf "%s" "$(action change-header "refresh failed: $build_error")"
+    return 0
+  fi
+
+  reload_pane_action "$pane" "refresh-preview"
+}
+
+# 1-9: jump straight to the workspace with that number, from either pane,
+# without needing it highlighted first. This calls the same CLI focus jump_to
+# would for a workspace row and aborts fzf directly, rather than trying to
+# steer the cursor onto that row and then fire `accept` — the latter would
+# race the persistent `load` binding's own cursor placement (see cmd_load)
+# for no benefit, since the outcome (that workspace gets focused, popup
+# closes) is identical either way.
+cmd_number() {
+  local n="$1" workspace_id response
+  in_input && return 0
+  [[ -n "$n" ]] || return 0
+
+  workspace_id="$(jq -r --argjson n "$n" \
+    '.result.snapshot.workspaces[] | select(.number == $n) | .workspace_id' \
+    "$PICKER_DIR/snapshot.json" 2>/dev/null | head -1)" || true
+
+  if [[ -z "$workspace_id" ]]; then
+    printf "%s" "$(action change-header "no workspace numbered $n")"
+    return 0
+  fi
+
+  if ! response="$("$HERDR" workspace focus "$workspace_id" 2>&1)"; then
+    printf "%s" "$(action change-header "jump failed: $(error_message "$response")")"
+    return 0
+  fi
+
+  record_jump "$workspace_id"
+  printf "abort"
+}
+
+# A bare id doesn't say whether it names a workspace or an agent pane, so
+# it's looked up against the cached snapshot the same way a row's own hidden
+# fields would carry that; an id the snapshot no longer has (the workspace or
+# pane it named is gone) is dropped from the history file right here rather
+# than left to the next load's prune.
+history_target_kind() {
+  local id="$1"
+  if jq -e --arg id "$id" '.result.snapshot.workspaces[]? | select(.workspace_id == $id)' \
+    "$PICKER_DIR/snapshot.json" >/dev/null 2>&1; then
+    echo workspaces
+  elif jq -e --arg id "$id" '.result.snapshot.agents[]? | select(.pane_id == $id)' \
+    "$PICKER_DIR/snapshot.json" >/dev/null 2>&1; then
+    echo agents
+  fi
+}
+
+# The single most specific id for "here" right now: the focused pane's own
+# id when that pane is one jump's own agent rows, else the focused
+# workspace. Used only to seed $PICKER_DIR/origin at picker open (see
+# cmd_picker) — the most *precise* record of where the session started, for
+# record_jump to push into history if this session's own jump turns out to
+# land somewhere workspace-different. Ctrl-o's own "is this history entry
+# the current location" check uses current_location_ids()'s full set
+# instead, precisely because a single id is not enough for that comparison —
+# see its own doc comment for the exact bug a single id caused.
+current_location_id() {
+  local snapshot="$1" pane_id
+  pane_id="$(jq -r '.result.snapshot.focused_pane_id // empty' <<<"$snapshot" 2>/dev/null)"
+  if [[ -n "$pane_id" ]] && jq -e --arg id "$pane_id" \
+    '.result.snapshot.agents[]? | select(.pane_id == $id)' <<<"$snapshot" >/dev/null 2>&1; then
+    printf '%s' "$pane_id"
+  else
+    jq -r '.result.snapshot.focused_workspace_id // empty' <<<"$snapshot" 2>/dev/null
+  fi
+}
+
+# Every id that currently means "here": the focused workspace, its focused
+# pane (if any), and its focused tab (if any) — not just one of them. Used
+# live by cmd_previous to know which history entries actually name the
+# current location.
+#
+# R2: a single representative id (the pre-fix version picked the focused
+# *pane* id whenever the focused pane was one of jump's own agent rows, else
+# the focused workspace id) missed exactly the case in the bug report: jump
+# to workspace B, whose own focused pane happens to be an agent B:p.
+# record_jump recorded the *workspace* id "B" (that was the literal target
+# of the jump), but a single-id "current location" would report "B:p" — so a
+# plain string compare against the history head "B" never matched, and
+# previous_target picked "B" right back as though it were a different place.
+# A set, checked by membership rather than equality, catches "B" however the
+# id representing "here" happens to be spelled.
+current_location_ids() {
+  local snapshot="$1"
+  jq -r '(.result.snapshot.focused_workspace_id // empty),
+         (.result.snapshot.focused_pane_id // empty),
+         (.result.snapshot.focused_tab_id // empty)
+         | select(length > 0)' <<<"$snapshot" 2>/dev/null
+}
+
+# $1 and $2 both resolved to the workspace they belong to (via
+# history_target_kind, the same lookup Ctrl-o already does to tell a
+# workspace id from an agent pane id apart) and compared — "same place" at
+# workspace granularity, not literal id equality. Empty if either side does
+# not resolve to anything in the current snapshot, so two ids that both fail
+# to resolve are never treated as equal by accident.
+same_workspace() {
+  local a="$1" b="$2" ws_a ws_b
+  case "$(history_target_kind "$a")" in
+  workspaces) ws_a="$a" ;;
+  agents) ws_a="$(jq -r --arg id "$a" \
+    '.result.snapshot.agents[]? | select(.pane_id == $id) | .workspace_id // empty' \
+    "$PICKER_DIR/snapshot.json" 2>/dev/null | head -1)" ;;
+  esac
+  [[ -n "$ws_a" ]] || return 1
+  case "$(history_target_kind "$b")" in
+  workspaces) ws_b="$b" ;;
+  agents) ws_b="$(jq -r --arg id "$b" \
+    '.result.snapshot.agents[]? | select(.pane_id == $id) | .workspace_id // empty' \
+    "$PICKER_DIR/snapshot.json" 2>/dev/null | head -1)" ;;
+  esac
+  [[ -n "$ws_b" && "$ws_a" == "$ws_b" ]]
+}
+
+# Record a completed A→B jump: push the location recorded as "origin" at
+# picker-open (see cmd_picker) ahead of the destination, then update origin
+# to the destination itself. Without the origin push, a bare
+# `history_record "$destination"` (the old behavior) never recorded A at
+# all — the first jump of a session had nothing for Ctrl-o to return to, and
+# a jump straight after that could only "return" to wherever some *earlier*
+# session had last landed, not to where this session actually started. Every
+# place a jump actually lands (cmd_picker's own accept flow, cmd_number,
+# cmd_previous) calls this instead of a bare history_record.
+#
+# R2: when origin and destination are the same location — literally, or
+# workspace-equivalent (same_workspace) — this is not a real A→B transition
+# at all (jumping to workspace B by number while B's own agent pane B:p was
+# already the origin does not go anywhere), so nothing is recorded, not even
+# the destination: a "jump" to where you already were is not a new history
+# entry to rank ahead of anything else.
+record_jump() {
+  local destination="$1" origin
+  origin="$(cat "$PICKER_DIR/origin" 2>/dev/null || true)"
+  if [[ -n "$origin" ]]; then
+    if [[ "$origin" == "$destination" ]] || same_workspace "$origin" "$destination"; then
+      printf '%s' "$destination" >"$PICKER_DIR/origin"
+      return 0
+    fi
+    history_record "$origin"
+  fi
+  history_record "$destination"
+  printf '%s' "$destination" >"$PICKER_DIR/origin"
+}
+
+# The most-recent history entry that does not name the current location — the
+# core selection logic behind Ctrl-o, split out from cmd_previous so it can
+# be exercised without a live jump_to call. $1 is current_location_ids' own
+# newline-separated output. $HISTORY_FILE is newest-first (see
+# history_record), so the first line encountered that is not a member of
+# that set is, by construction, the most recent *other* place jump has been.
+previous_target() {
+  local current_ids="$1" line
+  [[ -f "$HISTORY_FILE" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    grep -Fxq "$line" <<<"$current_ids" && continue
+    printf '%s' "$line"
+    return 0
+  done <"$HISTORY_FILE"
+}
+
+# Ctrl-o, normal mode only: jump back to the most recent history entry that
+# is not wherever the snapshot says focus is right now — not, as before,
+# blindly the second history line (see previous_target()'s own doc comment
+# for why that line-2 heuristic under-recorded the very first jump of a
+# session, and could point at the wrong place once anything moved focus
+# outside jump entirely).
+cmd_previous() {
+  local current_ids target kind tab_id response rc
+  [[ "$(mode)" == "normal" ]] || return 0
+
+  current_ids="$(current_location_ids "$(cat "$PICKER_DIR/snapshot.json" 2>/dev/null || echo '{}')")"
+  target="$(previous_target "$current_ids")"
+
+  if [[ -z "$target" ]]; then
+    printf "%s" "$(action change-header "no previous target")"
+    return 0
+  fi
+
+  kind="$(history_target_kind "$target")"
+  if [[ -z "$kind" ]]; then
+    history_remove "$target"
+    printf "%s" "$(action change-header "previous target no longer available")"
+    return 0
+  fi
+
+  tab_id=""
+  [[ "$kind" == "agents" ]] && tab_id="$(jq -r --arg id "$target" \
+    '.result.snapshot.agents[]? | select(.pane_id == $id) | .tab_id // empty' \
+    "$PICKER_DIR/snapshot.json" 2>/dev/null | head -1)"
+
+  rc=0
+  response="$(jump_to "$kind" "$target" "$tab_id" 2>&1)" || rc=$?
+  if ((rc != 0)); then
+    if ((rc == 3)); then
+      printf "%s" "$(action change-header "$(error_message "$response")")"
+    else
+      printf "%s" "$(action change-header "jump failed: $(error_message "$response")")"
+    fi
+    return 0
+  fi
+
+  record_jump "$target"
+  printf "abort"
+}
+
+# The `herdr agent read` invocation the agents-only output preview runs — the
+# preview command itself, embedded in a change-preview() action, not run
+# directly here. Shared between cmd_toggle_agent_preview (turning it on) and
+# restore_pane_preview (bringing it back after help borrowed the window).
+# {2} is fzf's own placeholder for the row's hidden target field (the
+# pane_id), substituted by fzf itself — not by this script — so it always
+# names whatever row is highlighted *when the preview runs*, and a stale
+# in-flight `agent read` for the row highlighted a moment ago is the process
+# fzf kills the instant a new one starts (see the fzf man page's own note on
+# how a command-form --preview/change-preview is rerun and its previous
+# invocation cancelled on every selection change) — nothing here has to poll
+# or debounce for that.
+agent_preview_cmd() {
+  local herdr_q
+  herdr_q="$(shq "$HERDR")"
+  printf '%s agent read {2} --source visible --lines %s --format text 2>&1 || printf %s' \
+    "$herdr_q" "$AGENT_PREVIEW_LINES" "'no output'"
+}
+
+# Force the preview window into a visible layout and point it at $1 (a full
+# preview command, e.g. `cat <path>` or agent_preview_cmd's own output),
+# labeled $2 — the shared "open an overlay" behavior behind cmd_help and
+# cmd_toggle_agent_preview. Deliberately does this even when
+# preview_collapsed (falling back to a bottom split rather than the normal
+# side one) rather than checking effective_preview the way the *normal*
+# preview does: before this, ?/o only ever checked the raw `preview` config
+# flag, so in a narrow terminal — where activate_pane/cmd_picker had already
+# hidden the window for width, independent of that flag — pressing either
+# silently changed preview content behind a still-hidden window. cmd_resize
+# re-applies whichever of the two layouts below still applies whenever the
+# terminal is resized while help or the agent output preview is showing.
+show_overlay_preview() {
+  local preview_cmd="$1" label="$2" pane side ratio_pct
+  printf "%s+change-preview-label( %s )" "$(action change-preview "$preview_cmd")" "$label"
+  if preview_collapsed; then
+    printf "+change-preview-window(down,50%%)"
+  else
+    pane="$(current_pane)"
+    side="$(pane_side "$pane")"
+    ratio_pct="$(cfg_valid pane_ratio 35 valid_pane_ratio)"
+    [[ "$pane" == "workspaces" ]] && ratio_pct=$((100 - ratio_pct))
+    printf "+change-preview-window(%s,%d%%,border-rounded)" "$side" "$ratio_pct"
+  fi
+}
+
+# `o`, agents pane only: toggle the preview window between the other pane's
+# list (the normal state) and the highlighted agent's own recent terminal
+# output. A second `o`, or leaving the agents pane at all (activate_pane
+# clears the flag unconditionally — see there), restores the list. A no-op
+# with a header notice when `preview = false`: there is no preview window to
+# borrow in the first place — but, unlike the normal other-pane preview, a
+# narrow terminal alone does not stop this; see show_overlay_preview.
+cmd_toggle_agent_preview() {
+  local pane
+  in_input && return 0
+  pane="$(current_pane)"
+  [[ "$pane" == "agents" ]] || return 0
+
+  if ! preview_enabled; then
+    printf "%s" "$(action change-header "output preview unavailable: preview is disabled")"
+    return 0
+  fi
+
+  if [[ -f "$PICKER_DIR/agent_preview_active" ]]; then
+    rm -f "$PICKER_DIR/agent_preview_active"
+    printf "%s" "$(restore_pane_preview "$pane")"
+  else
+    : >"$PICKER_DIR/agent_preview_active"
+    printf "%s" "$(show_overlay_preview "$(agent_preview_cmd)" "output")"
+  fi
+}
+
+# Static help text for `?`. Written once per picker session (see cmd_picker)
+# since it never changes; cmd_help swaps the preview window to it and back.
+help_text() {
+  cat <<'EOF'
+  jump — keyboard shortcuts
+
+  Navigation & Panes
+    j / k, arrows, ctrl-n/p   Move selection cursor up / down
+    h / l, Tab, Shift-Tab     Switch active pane (Workspaces ↔ Agents)
+    1-9                       Jump directly to workspace number N
+    ⏎ (Enter)                 Jump to selected workspace or agent
+    ctrl-o                    Jump to previous target (jump history)
+
+  Workspaces Pane
+    J / K                     Reorder highlighted workspace up / down
+    a                         Add new workspace (label → directory)
+    d                         Close highlighted workspace (requires confirmation)
+    r, F2                     Rename highlighted workspace
+
+  Agents Pane
+    r, F2                     Rename highlighted agent
+    w                         Cycle workspace scope (all → current → highlighted)
+    o                         Toggle agent terminal output preview
+
+  General & Filtering
+    /                         Enter search mode (type to filter rows)
+    s                         Cycle status filter (all → blocked → done → working → idle)
+    ctrl-r                    Refresh data snapshot from herdr
+    ?                         Toggle this help window
+    esc, q                    Close help / exit input mode / exit Jump
+EOF
+}
+
+# What the preview window should show for a pane other than the one on
+# screen right now, and how to get there: normally that other pane's own
+# list at normal_preview_action's own layout (hidden outright if
+# effective_preview is now false — e.g. the terminal shrank while help or the
+# agent output preview was covering the window), but the agents pane's
+# output preview (see cmd_toggle_agent_preview) takes over the window the
+# same way help does, so whichever of the two was left active is the one
+# restored — shared by cmd_help's own second press and by the escape handler
+# backing out of help while output was already up.
+restore_pane_preview() {
+  local pane
+  pane="$1"
+  if [[ "$pane" == "agents" && -f "$PICKER_DIR/agent_preview_active" ]]; then
+    printf "%s" "$(show_overlay_preview "$(agent_preview_cmd)" "output")"
+  else
+    normal_preview_action "$pane"
+  fi
+}
+
+# `?`: swap the preview window (normally the other pane, or the agents-only
+# output preview when that is active) for the static help text, and back on a
+# second press. Tracked with a flag file rather than by inspecting the
+# current preview content, since that content is itself just `cat`'d from a
+# file and not otherwise visible to this process. A no-op with a header
+# notice when `preview = false`, same as cmd_toggle_agent_preview: there is
+# no preview window to borrow — but, unlike the normal other-pane preview, a
+# narrow terminal alone does not stop this; see show_overlay_preview.
+cmd_help() {
+  local pane
+  in_input && return 0
+  pane="$(current_pane)"
+
+  if ! preview_enabled; then
+    printf "%s" "$(action change-header "help unavailable: preview is disabled")"
+    return 0
+  fi
+
+  if [[ -f "$PICKER_DIR/help_active" ]]; then
+    rm -f "$PICKER_DIR/help_active"
+    printf "%s" "$(restore_pane_preview "$pane")"
+  else
+    : >"$PICKER_DIR/help_active"
+    printf "%s" "$(show_overlay_preview "cat $(shq "$PICKER_DIR/help.txt")" "help")"
+  fi
+}
+
+# The header appropriate for whatever mode the picker is *currently* in,
+# reusing the exact same builder each mode-entry function itself uses
+# (rename_header, add_label_header, add_dir_header, close_header, or
+# header_for for plain normal/search) so this can never drift from what
+# actually entering that mode would have shown — see cmd_resize's own doc
+# comment for why drifting here (R1) was a real bug, not a cosmetic one.
+# Mode and its associated target/dir are read back from the same state
+# files/prompt glyph every other --key handler already reads them from. A
+# transient one-off notice shown while still in *normal* mode (a "refresh
+# failed: ..." header, say) is not reconstructed here — losing that specific
+# wording on a resize is cosmetic, unlike showing "Enter jump" while Enter
+# would actually close a workspace.
+header_for_mode() {
+  local pane="$1" m target dir
+  m="$(mode)"
+  case "$m" in
+  rename)
+    rename_header "$pane"
+    ;;
+  add)
+    dir="$(cat "$PICKER_DIR/pending_dir" 2>/dev/null || true)"
+    add_label_header "$dir"
+    ;;
+  add_dir)
+    add_dir_header
+    ;;
+  confirm)
+    target="$(cat "$PICKER_DIR/pending_target" 2>/dev/null || true)"
+    close_header "$target"
+    ;;
+  *)
+    header_for "$pane"
+    ;;
+  esac
+}
+
+# Bound to fzf's own `resize` event (terminal geometry changed while the
+# picker is open). Recomputes whichever of the current mode's header and the
+# preview window's visibility/layout depend on $FZF_COLUMNS and reapplies
+# them — the same choices activate_pane/cmd_help/the mode-entry functions
+# would have made had the terminal always been this width.
+#
+# R1: an earlier version unconditionally reissued header_for() — the plain
+# normal-mode nav hints ("... ⏎ jump ...") — regardless of what mode the
+# picker was actually in. Resizing the terminal while a close confirmation
+# was up therefore silently relabeled Enter as "jump" while it still, in
+# reality, closed the workspace: a destructive action left mislabeled as a
+# read-only one. header_for_mode() is what makes the header mode-aware
+# instead.
+#
+# If help or the agent output preview is currently borrowing the window, its
+# own layout (side split vs. the narrow-terminal bottom split) is recomputed
+# instead of the normal other-pane preview, so shrinking or growing the
+# terminal while either is open doesn't silently leave it sized for the old
+# width.
+cmd_resize() {
+  local pane
+  pane="$(current_pane)"
+  printf "change-header(%s)" "$(header_for_mode "$pane")"
+  if [[ -f "$PICKER_DIR/help_active" ]]; then
+    printf "+%s" "$(show_overlay_preview "cat $(shq "$PICKER_DIR/help.txt")" "help")"
+  elif [[ -f "$PICKER_DIR/agent_preview_active" ]]; then
+    printf "+%s" "$(show_overlay_preview "$(agent_preview_cmd)" "output")"
+  else
+    printf "+%s" "$(normal_preview_action "$pane")"
+  fi
 }
 
 cmd_key() {
@@ -143,18 +1383,107 @@ cmd_key() {
     activate_pane "$(other_pane "$pane")"
     ;;
   search)
-    searching || printf "unbind(%s)+enable-search+clear-query+change-prompt(/ )" "$NAV_KEYS"
+    if ! searching; then
+      save_search_query "$pane" ""
+      printf 'search' >"$PICKER_DIR/search_mode.$pane"
+      printf "unbind(%s)+enable-search+clear-query+change-prompt(/ )" "$NAV_KEYS"
+    fi
     ;;
   escape)
-    if searching; then
+    if [[ -f "$PICKER_DIR/help_active" ]]; then
+      rm -f "$PICKER_DIR/help_active"
+      printf "%s" "$(restore_pane_preview "$pane")"
+    elif adding_dir; then
+      # Back a step, not out of add mode entirely — Esc from the label step
+      # (handled by the plain in_input branch below) is the one that cancels.
+      cmd_add_dir_back
+    elif in_input; then
+      leave_input "$pane"
+    elif searching; then
       # wait barrier for the same reason as activate_pane.
       printf "rebind(%s)+clear-query+wait+disable-search+change-prompt(❯ )" "$NAV_KEYS"
+      save_search_query "$pane" ""
+      printf 'normal' >"$PICKER_DIR/search_mode.$pane"
     else
       printf "abort"
     fi
     ;;
   move-up | move-down)
     cmd_move "${1#move-}" "${2:-}"
+    ;;
+  rename)
+    cmd_rename_start "${2:-}"
+    ;;
+  add)
+    cmd_add_start
+    ;;
+  close)
+    cmd_close_start "${2:-}"
+    ;;
+  # ctrl-u pages in normal mode and clears the line in an input mode, as it
+  # does in any readline input.
+  ctrl-u)
+    if in_input; then printf "clear-query"; else printf "half-page-up"; fi
+    ;;
+  # y/n are only bound while a close is awaiting confirmation; in every other
+  # mode they are unbound, or type into the query.
+  yes)
+    if confirming; then cmd_close_apply; fi
+    ;;
+  no)
+    if confirming; then leave_input "$pane"; fi
+    ;;
+  enter)
+    case "$(mode)" in
+    rename) cmd_rename_apply ;;
+    add) cmd_add_label_apply ;;
+    add_dir) cmd_add_dir_apply ;;
+    confirm) cmd_close_apply ;;
+    # The empty-target placeholder row ("no workspaces"/"no agents") has
+    # nothing to jump to, so it stays put rather than closing the popup.
+    *) [[ -n "${2:-}" ]] && printf "accept" ;;
+    esac
+    ;;
+  load)
+    cmd_load "${2:-}"
+    ;;
+  focus)
+    cmd_focus "${2:-}"
+    ;;
+  query)
+    cmd_query
+    ;;
+  status)
+    cmd_status_filter
+    ;;
+  scope)
+    cmd_scope_filter
+    ;;
+  refresh)
+    cmd_refresh
+    ;;
+  number)
+    cmd_number "${2:-}"
+    ;;
+  help)
+    cmd_help
+    ;;
+  previous)
+    cmd_previous
+    ;;
+  agent-preview)
+    cmd_toggle_agent_preview
+    ;;
+  resize)
+    cmd_resize
+    ;;
+  # Bound to fzf's own `start` event, fired once before anything else. The
+  # only mode this ever needs to establish up front is search_first; every
+  # other mode (rename/add/confirm) only ever begins from a normal-mode key.
+  startup)
+    if [[ "$(cfg_valid search_first false valid_bool)" == "true" ]]; then
+      printf "unbind(%s)+enable-search+change-prompt(/ )" "$NAV_KEYS"
+    fi
     ;;
   *)
     echo "unknown jump key: ${1:-}" >&2
@@ -170,9 +1499,24 @@ cmd_key() {
 # workspace reordering (header_for() drops the hint so the key is never
 # advertised) and, in a split tab, landing on the agent's exact pane.
 
+# A `nc` on PATH is not necessarily one that understands Unix-domain sockets:
+# the BSD nc bundled with macOS supports -U, but the pure POSIX/GNU builds
+# common on minimal Linux images silently reject it (or worse, hang waiting
+# on stdin). socat always supports it, so it wins when both are present;
+# nc is only trusted after actually checking its own -h output for -U.
+nc_supports_unix() {
+  command -v nc >/dev/null 2>&1 || return 1
+  # `nc -h`/--help conventionally exits non-zero after printing usage, and
+  # with `pipefail` (set globally above) that would fail this whole pipeline
+  # regardless of what grep finds — so nc's own exit status is discarded here
+  # and only grep's is left to matter.
+  { nc -h 2>&1 || true; } | grep -q -- '-U'
+}
+
 socket_available() {
   [[ -S "$SOCKET" ]] || return 1
-  command -v socat >/dev/null 2>&1 || command -v nc >/dev/null 2>&1
+  command -v socat >/dev/null 2>&1 && return 0
+  nc_supports_unix
 }
 
 # One newline-delimited JSON request in, one response line out.
@@ -182,6 +1526,72 @@ socket_send() {
   else
     printf '%s\n' "$1" | nc -w 2 -U "$SOCKET" 2>/dev/null
   fi
+}
+
+# A raw socket reply is only ever trusted when it unambiguously answers this
+# request: matching id, and exactly one of a `result` or an `error` envelope.
+# Anything else — no reply, a stray/late reply for a different id, or a
+# malformed envelope — reads as failure rather than success.
+socket_reply_ok() {
+  local id="$1" resp="$2"
+  [[ -n "$resp" ]] || return 1
+  jq -e --arg id "$id" '(.id // empty) == $id' <<<"$resp" >/dev/null 2>&1 || return 1
+  jq -e 'has("error")' <<<"$resp" >/dev/null 2>&1 && return 1
+  jq -e 'has("result")' <<<"$resp" >/dev/null 2>&1
+}
+
+#######################################################
+# HISTORY
+#######################################################
+# One id (a workspace_id or an agent's pane_id) per line in $HISTORY_FILE,
+# newest first. Feeds Ctrl-o (cmd_previous) and `order = "recent"`
+# (render_rows). Written to (via record_jump, not history_record directly —
+# see its own doc comment) at the end of every completed jump: cmd_picker's
+# own selection, cmd_number, and cmd_previous itself — never anywhere a jump
+# might still fail partway through.
+
+# Record a successful jump to $1, moving it to the front if it was already
+# present (no duplicate entries) and capping the file at 50 lines (a plugin
+# picker's jump history has no reason to grow without bound). grep's exit
+# status is discarded: it is 1, not an error, on a brand new or single-line
+# file with nothing left to print once $1 itself is filtered out.
+history_record() {
+  local id="$1" tmp
+  [[ -n "$id" ]] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  tmp="$HISTORY_FILE.tmp.$$"
+  {
+    printf '%s\n' "$id"
+    grep -Fx -v "$id" "$HISTORY_FILE" 2>/dev/null || true
+  } | head -n 50 >"$tmp" && mv "$tmp" "$HISTORY_FILE"
+}
+
+# Drop $1 from the history file outright — used when an id in it no longer
+# resolves to anything in the current snapshot (history_target_kind came back
+# empty). Same grep-exit-status caveat as history_record.
+history_remove() {
+  local id="$1" tmp
+  [[ -f "$HISTORY_FILE" ]] || return 0
+  tmp="$HISTORY_FILE.tmp.$$"
+  grep -Fx -v "$id" "$HISTORY_FILE" 2>/dev/null >"$tmp" || true
+  mv "$tmp" "$HISTORY_FILE"
+}
+
+# Called once per picker session, right after the very first render_rows (see
+# cmd_picker): drops every history entry that names a workspace or pane the
+# current snapshot doesn't have, so a jump list that has since lost entries
+# to workspace/tab closures does not keep offering them via Ctrl-o or letting
+# them squat on a `recent` sort position forever.
+history_prune() {
+  local snapshot="$1" tmp ids_tmp
+  [[ -f "$HISTORY_FILE" ]] || return 0
+  ids_tmp="$HISTORY_FILE.ids.$$"
+  tmp="$HISTORY_FILE.tmp.$$"
+  jq -r '(.result.snapshot.workspaces[]?.workspace_id), (.result.snapshot.agents[]?.pane_id)' \
+    "$snapshot" 2>/dev/null | sort -u >"$ids_tmp" || : >"$ids_tmp"
+  grep -Fxf "$ids_tmp" "$HISTORY_FILE" 2>/dev/null >"$tmp" || : >"$tmp"
+  mv "$tmp" "$HISTORY_FILE"
+  rm -f "$ids_tmp"
 }
 
 #######################################################
@@ -195,34 +1605,110 @@ socket_send() {
 # switches workspace, tab and that tab's own pane, then the exact pane over the
 # socket when one is reachable, for agents sharing a split with something else.
 #
-# Output and exit status are the caller's error surface: anything printed on
-# failure is shown before the popup closes.
-focus_agent() {
-  local pane_id="$1" info tab_id
+# tab_id comes from the snapshot the row was built from (see render_rows), not
+# from a fresh `agent get` call: one snapshot already has it, and asking again
+# would be a second request for data the popup already has in hand. That row
+# can go stale between opening the picker and pressing enter — the agent's
+# pane closed, or it hopped to a different tab — so either a failed tab focus
+# or a failed exact-pane focus re-snapshots once and retries with whatever
+# tab_id that agent has now, before giving up.
+#
+# Output and exit status are the caller's error surface. Status 3 means the
+# tab-level hop succeeded but exact-pane focus did not; callers show that
+# partial-success notice and deliberately do not record it in history.
+focus_exact_pane() {
+  local pane_id id resp
+  pane_id="$1"
+  id="jump-pane-$$-${RANDOM}"
+  resp="$(socket_send "$(jq -nc --arg id "$id" --arg pid "$pane_id" \
+    '{ id: $id, method: "pane.focus", params: { pane_id: $pid } }')")"
+  socket_reply_ok "$id" "$resp"
+}
 
-  info="$("$HERDR" agent get "$pane_id" 2>&1)" || {
-    printf '%s\n' "$info"
-    return 1
-  }
-  tab_id="$(jq -r '.result.agent.tab_id // empty' <<<"$info" 2>/dev/null)"
-  if [[ -z "$tab_id" ]]; then
-    printf '%s\n' "$info"
-    return 1
+focus_agent() {
+  local pane_id tab_id err pane_count snapshot_json fresh_tab
+  pane_id="$1"
+  tab_id="$2"
+
+  if [[ -z "$tab_id" ]] || ! err="$("$HERDR" tab focus "$tab_id" 2>&1)"; then
+    tab_id="$("$HERDR" api snapshot 2>/dev/null | jq -r --arg pid "$pane_id" \
+      '.result.snapshot.agents[] | select(.pane_id == $pid) | .tab_id // empty' \
+      2>/dev/null | head -1)" || true
+    if [[ -z "$tab_id" ]]; then
+      printf '%s\n' "${err:-jump: agent not found (closed?)}"
+      return 1
+    fi
+    if ! err="$("$HERDR" tab focus "$tab_id" 2>&1)"; then
+      printf '%s\n' "$err"
+      return 1
+    fi
   fi
 
-  "$HERDR" tab focus "$tab_id" >/dev/null || return 1
+  if ! socket_available; then
+    # Without socat/nc -U there is no way to focus the exact pane, only the
+    # tab — a notice only worth printing when that tab is actually split, so
+    # a single-pane tab (the common case) does not get a spurious warning.
+    if snapshot_json="$("$HERDR" api snapshot 2>/dev/null)"; then
+      fresh_tab="$(jq -r --arg pid "$pane_id" \
+        '.result.snapshot.agents[]? | select(.pane_id == $pid) | .tab_id // empty' \
+        <<<"$snapshot_json" 2>/dev/null | head -1)"
+      if [[ -z "$fresh_tab" ]]; then
+        echo "tab focused, exact pane unavailable (no socat/nc -U)"
+        return 3
+      fi
+      if [[ "$fresh_tab" != "$tab_id" ]] && ! err="$("$HERDR" tab focus "$fresh_tab" 2>&1)"; then
+        echo "tab focused, exact pane unavailable (no socat/nc -U)"
+        return 3
+      fi
+      tab_id="$fresh_tab"
+      pane_count="$(jq -r --arg t "$tab_id" \
+        '.result.snapshot.tabs[]? | select(.tab_id == $t) | .pane_count // 1' \
+        <<<"$snapshot_json" 2>/dev/null)" || pane_count=1
+    else
+      pane_count="$(jq -r --arg t "$tab_id" \
+        '.result.snapshot.tabs[]? | select(.tab_id == $t) | .pane_count // 1' \
+        "$PICKER_DIR/snapshot.json" 2>/dev/null)" || pane_count=1
+    fi
+    if [[ "${pane_count:-1}" =~ ^[0-9]+$ ]] && ((pane_count > 1)); then
+      echo "tab focused, exact pane unavailable (no socat/nc -U)"
+      return 3
+    fi
+    return 0
+  fi
 
-  if socket_available; then
-    socket_send "$(jq -nc --arg id "$pane_id" \
-      '{ id: "jump-pane", method: "pane.focus", params: { pane_id: $id } }')" \
-      >/dev/null
+  focus_exact_pane "$pane_id" && return 0
+
+  # The tab focus may have succeeded with stale row data while the agent pane
+  # moved to another tab. Re-snapshot and retry the complete tab+pane hop once,
+  # rather than treating the first exact-pane failure as success.
+  if ! snapshot_json="$("$HERDR" api snapshot 2>/dev/null)"; then
+    echo "tab focused, exact pane unavailable"
+    return 3
+  fi
+  fresh_tab="$(jq -r --arg pid "$pane_id" \
+    '.result.snapshot.agents[]? | select(.pane_id == $pid) | .tab_id // empty' \
+    <<<"$snapshot_json" 2>/dev/null | head -1)"
+  if [[ -z "$fresh_tab" ]] || ! err="$("$HERDR" tab focus "$fresh_tab" 2>&1)"; then
+    echo "tab focused, exact pane unavailable"
+    return 3
+  fi
+
+  pane_count="$(jq -r --arg t "$fresh_tab" \
+    '.result.snapshot.tabs[]? | select(.tab_id == $t) | .pane_count // 1' \
+    <<<"$snapshot_json" 2>/dev/null)" || pane_count=1
+  if [[ "${pane_count:-1}" =~ ^[0-9]+$ ]] && ((pane_count <= 1)); then
+    return 0
+  fi
+  if ! focus_exact_pane "$pane_id"; then
+    echo "tab focused, exact pane unavailable"
+    return 3
   fi
 }
 
 jump_to() {
   case "$1" in
   workspaces) "$HERDR" workspace focus "$2" ;;
-  agents) focus_agent "$2" ;;
+  agents) focus_agent "$2" "$3" ;;
   esac
 }
 
@@ -235,93 +1721,626 @@ jump_to() {
 # therefore at-1, but moving down is at+2: at+1 is the workspace's own slot and
 # would be a no-op. at+2 == length is valid and appends to the end.
 #
-# Returns non-zero when nothing moved — already at that end of the list, or the
-# server refused — so the caller can leave the list untouched.
+# Return codes distinguish two silent-looking outcomes so cmd_move can tell
+# them apart: 1 is a real failure (couldn't read the order, or the server
+# refused the move) and worth a header error; 2 is "nothing to do" — already
+# at that end of the list — which is not a failure at all and should stay
+# quiet exactly like it always has.
 move_workspace() {
-  local workspace_id="$1" direction="$2" insert_index response
+  local workspace_id="$1" direction="$2" insert_index response snapshot_json
 
-  # Re-read the order instead of trusting the popup's snapshot: insert_index is
-  # positional, so a list that shifted under us would reorder the wrong row.
-  insert_index="$("$HERDR" workspace list | jq -r \
+  # Re-read the order with a fresh `herdr api snapshot` call instead of
+  # trusting the popup's cached rows: insert_index is positional, so a list
+  # that shifted under us would reorder the wrong row.
+  if ! snapshot_json="$("$HERDR" api snapshot 2>&1)"; then
+    return 1
+  fi
+
+  insert_index="$(jq -r \
     --arg id "$workspace_id" --arg dir "$direction" '
-      .result.workspaces as $ws
+      .result.snapshot.workspaces as $ws
       | ($ws | length) as $len
       | ($ws | map(.workspace_id) | index($id)) as $at
       | if   $at == null    then empty
         elif $dir == "up"   then (if $at == 0 then empty else $at - 1 end)
         else                     (if $at >= $len - 1 then empty else $at + 2 end)
-        end')"
+        end' <<<"$snapshot_json" 2>/dev/null)" || true
 
-  [[ -n "$insert_index" ]] || return 1
+  [[ -n "$insert_index" ]] || return 2
 
   response="$(socket_send "$(jq -nc \
     --arg id "$workspace_id" --argjson at "$insert_index" \
     '{ id: "jump-move", method: "workspace.move",
        params: { workspace_id: $id, insert_index: $at } }')")"
 
-  # A raw socket call reports refusal in the payload, not the exit status, so
-  # insist on a result rather than merely the absence of an error: an empty or
-  # unparseable reply then reads as failure too.
-  [[ -n "$response" ]] && jq -e 'has("result")' <<<"$response" >/dev/null 2>&1
+  socket_reply_ok "jump-move" "$response"
 }
 
 # fzf hands over the highlighted row's workspace id; the list is rebuilt in
-# place and the cursor follows the row that moved.
+# place and the persistent `load` binding (cmd_load) lands the cursor back on
+# the row that moved, wherever it ended up.
 cmd_move() {
-  local direction="$1" workspace_id="$2" position
+  local direction="$1" workspace_id="$2" rc=0 build_error
 
   socket_available || return 0
   [[ "$(current_pane)" == "workspaces" ]] || return 0
   [[ -n "$workspace_id" ]] || return 0
-  move_workspace "$workspace_id" "$direction" || return 0
 
-  build_rows
-  position="$(awk -F'\t' -v id="$workspace_id" '$2 == id { print NR; exit }' \
-    "$PICKER_DIR/rows.workspaces")"
-  [[ -n "$position" ]] || position=1
+  move_workspace "$workspace_id" "$direction" || rc=$?
+  if ((rc == 2)); then
+    return 0 # already at that end of the list — not an error, stay quiet.
+  elif ((rc != 0)); then
+    printf "%s" "$(action change-header "reorder failed: workspace.move was refused")"
+    return 0
+  fi
 
-  # Remember it as the pane's cursor as well, so toggling over to agents and
-  # back returns to the row that moved rather than to the focused workspace.
-  printf '%s\n' "$position" >"$PICKER_DIR/pos.workspaces"
+  # The full round trip, not render_rows() alone: workspace.move just
+  # mutated server state (the actual order), so the cached snapshot is stale.
+  if ! build_error="$(refresh_snapshot)"; then
+    printf "%s" "$(action change-header "refresh failed: $build_error")"
+    return 0
+  fi
+  printf '%s\n' "$workspace_id" >"$PICKER_DIR/cursor.workspaces"
 
-  # refresh-preview because agents sort by workspace order, so the panel behind
-  # the preview window has just been rewritten too.
-  printf "reload-sync(cat '%s')+pos(%s)+refresh-preview" \
-    "$PICKER_DIR/rows.workspaces" "$position"
+  # refresh-preview because agents sort by workspace order, so the panel
+  # behind the preview window has just been rewritten too.
+  reload_pane_action workspaces "refresh-preview"
+}
+
+#######################################################
+# RENAMING
+#######################################################
+# fzf's query line doubles as the input box: search stays disabled so typing
+# never filters the row away, the bare keys are unbound so they type, and the
+# cursor keys (and Shift-Tab, and mouse) are parked so the row the name lands
+# on is the row it started on. FZF_QUERY carries the text back into the
+# transform that applies it.
+
+current_name() {
+  awk -F'\t' -v id="$2" '$1 == id { print substr($0, length($1) + 2); exit }' \
+    "$PICKER_DIR/names.$1"
+}
+
+# Leading and trailing whitespace stripped from whatever was typed.
+query_text() {
+  local text="${FZF_QUERY:-}"
+  text="${text#"${text%%[![:space:]]*}"}"
+  text="${text%"${text##*[![:space:]]}"}"
+  printf '%s' "$text"
+}
+
+# herdr's CLI reports failure in the payload as well as the exit status; pull
+# the message out when there is one.
+error_message() {
+  local message
+  message="$(jq -r '.error.message // empty' <<<"$1" 2>/dev/null || true)"
+  printf '%s' "${message:-$1}"
+}
+
+# The rename-mode header for $1 (a pane name) — shared by cmd_rename_start
+# and cmd_resize (see close_header's own doc comment for why: one builder,
+# reused by both, so they cannot drift).
+rename_header() {
+  if [[ "$1" == "agents" ]]; then
+    printf '⏎ apply · empty clears the name · esc cancel'
+  else
+    printf '⏎ apply · esc cancel'
+  fi
+}
+
+cmd_rename_start() {
+  local target="$1" pane
+  pane="$(current_pane)"
+  in_input && return 0
+  [[ -n "$target" ]] || return 0
+
+  # Pinned to the state file rather than trusted from {2} again on submit:
+  # {2} at that point would be whatever row the cursor is *currently* on, and
+  # input mode is not supposed to let the cursor move at all.
+  printf '%s\n' "$target" >"$PICKER_DIR/pending_target"
+
+  enter_input '✎ ' "$(rename_header "$pane")"
+  printf "+%s" "$(action change-query "$(current_name "$pane" "$target")")"
+}
+
+# Empty is a valid answer for agents — it drops the custom name and the row
+# falls back to the detected agent kind. Workspaces never reach here empty.
+rename_target() {
+  local pane="$1" target="$2" name="$3"
+  case "$pane" in
+  workspaces)
+    "$HERDR" workspace rename "$target" "$name"
+    ;;
+  agents)
+    if [[ -n "$name" ]]; then
+      "$HERDR" agent rename "$target" "$name"
+    else
+      "$HERDR" agent rename "$target" --clear
+    fi
+    ;;
+  esac
+}
+
+cmd_rename_apply() {
+  local pane name response target
+  pane="$(current_pane)"
+  target="$(cat "$PICKER_DIR/pending_target" 2>/dev/null || true)"
+  name="$(query_text)"
+
+  # Nothing to do when the name is unchanged, or when a workspace would be
+  # left without one; either reads as a cancel.
+  if [[ -z "$target" || "$name" == "$(current_name "$pane" "$target")" ]] ||
+    [[ "$pane" == "workspaces" && -z "$name" ]]; then
+    leave_input "$pane"
+    return 0
+  fi
+
+  # leave_input runs only once the call has actually resolved: applying it
+  # first would clear the typed name before knowing whether it took, so a
+  # failure had nothing left to show the user but a blank prompt.
+  if ! response="$(rename_target "$pane" "$target" "$name" 2>&1)"; then
+    printf "%s" "$(action change-header "rename failed: $(error_message "$response")")"
+    return 0
+  fi
+
+  leave_input "$pane"
+  printf "+%s" "$(refresh_to "$pane" "$target")"
+}
+
+#######################################################
+# ADDING AND CLOSING WORKSPACES
+#######################################################
+# Both only make sense on the workspaces pane. Closing asks for a y/n first,
+# since it takes every tab and pane in the workspace with it.
+#
+# Adding is two steps, each borrowing the query line the same way renaming
+# does: a label (mode "add", prompt '+ '), then a directory (mode "add_dir",
+# prompt '@ ', prefilled with the default) — see mode()/adding_dir(). Esc from
+# the label step cancels like any other input mode; Esc from the dir step
+# goes back one step to the label instead (cmd_add_dir_back, wired through
+# cmd_key's escape case), so a typo'd directory doesn't lose the label too.
+
+# The directory a new workspace defaults to: the globally focused pane's own
+# cwd (what herdr's own new-workspace key inherits, and the closest thing to
+# "this workspace's directory" the snapshot carries — workspaces themselves
+# have no cwd field of their own, only their panes do), else $HOME.
+default_workspace_dir() {
+  local dir
+  dir="$(jq -r '.result.snapshot.focused_pane_id as $fp
+      | .result.snapshot.panes[]? | select(.pane_id == $fp) | .cwd // empty' \
+    "$PICKER_DIR/snapshot.json" 2>/dev/null | head -1)" || true
+  printf '%s' "${dir:-$HOME}"
+}
+
+# The add-workspace step-1 (label) header for directory $1 — shared by
+# cmd_add_start, cmd_add_dir_back, and cmd_resize (see close_header's own
+# doc comment for why: one builder, reused by all three).
+add_label_header() {
+  printf '⏎ next · dir: %s · esc cancel' "$1"
+}
+
+# The add-workspace step-2 (directory) header — shared by cmd_add_label_apply
+# and cmd_resize. Static today, but a function for the same
+# no-drift reason as add_label_header/rename_header/close_header, and so a
+# future per-directory hint here does not have to be added in two places.
+add_dir_header() {
+  printf '⏎ create · esc back'
+}
+
+cmd_add_start() {
+  in_input && return 0
+  [[ "$(current_pane)" == "workspaces" ]] || return 0
+
+  local dir
+  dir="$(default_workspace_dir)"
+  printf '%s\n' "$dir" >"$PICKER_DIR/pending_dir"
+  : >"$PICKER_DIR/pending_label"
+  enter_input '+ ' "$(add_label_header "$dir")"
+}
+
+# Step 1 -> 2: stash the label, hand the query line to the directory instead,
+# prefilled with the default computed in cmd_add_start (or recomputed here if
+# that file is somehow missing).
+cmd_add_label_apply() {
+  local label dir
+  label="$(query_text)"
+  printf '%s\n' "$label" >"$PICKER_DIR/pending_label"
+
+  dir="$(cat "$PICKER_DIR/pending_dir" 2>/dev/null || true)"
+  [[ -n "$dir" ]] || dir="$(default_workspace_dir)"
+
+  printf "%s" "$(action change-prompt '@ ')"
+  printf "+%s" "$(action change-header "$(add_dir_header)")"
+  printf "+%s" "$(action change-query "$dir")"
+}
+
+# Back to step 1 (Esc from the directory step): restore the label typed
+# there, not a plain cancel — see the section doc comment above.
+cmd_add_dir_back() {
+  local label dir
+  label="$(cat "$PICKER_DIR/pending_label" 2>/dev/null || true)"
+  dir="$(cat "$PICKER_DIR/pending_dir" 2>/dev/null || true)"
+  printf "%s" "$(action change-prompt '+ ')"
+  printf "+%s" "$(action change-header "$(add_label_header "$dir")")"
+  printf "+%s" "$(action change-query "$label")"
+}
+
+# Step 2: validate the directory and create the workspace. Created without
+# focus so the popup stays put: the cursor lands on the new row, and ⏎ from
+# there is the jump — same as before this phase, just one step later.
+cmd_add_dir_apply() {
+  local dir label expanded response workspace_id
+  dir="$(query_text)"
+  label="$(cat "$PICKER_DIR/pending_label" 2>/dev/null || true)"
+
+  # Expand a leading ~ the way a shell would; herdr's --cwd takes a literal
+  # path and does not do this itself. `${expanded:2}` rather than
+  # `${expanded#~/}`: bash tilde-expands the pattern side of a `#` removal
+  # itself, so `~/` there means "the real $HOME/", not the two literal
+  # characters — it would silently fail to strip a *literal* leading `~/`,
+  # which is exactly the text being matched here. The `[[ == ~/* ]]` test just
+  # above does not have that problem (its pattern is matched literally), so
+  # the mismatch between the two is what makes this worth calling out.
+  expanded="$dir"
+  if [[ "$expanded" == "~" ]]; then
+    expanded="$HOME"
+  elif [[ "$expanded" == "~/"* ]]; then
+    expanded="$HOME/${expanded:2}"
+  fi
+  [[ -n "$expanded" ]] || expanded="$(default_workspace_dir)"
+
+  if [[ ! -d "$expanded" ]]; then
+    printf "%s" "$(action change-header "no such directory: $dir · esc back")"
+    return 0
+  fi
+  printf '%s\n' "$expanded" >"$PICKER_DIR/pending_dir"
+
+  # leave_input runs only once the call has resolved, same as rename: apply it
+  # first and a failure would have nothing left to show but a blank prompt.
+  if [[ -n "$label" ]]; then
+    response="$("$HERDR" workspace create --no-focus --cwd "$expanded" --label "$label" 2>&1)"
+  else
+    response="$("$HERDR" workspace create --no-focus --cwd "$expanded" 2>&1)"
+  fi || {
+    printf "%s" "$(action change-header "create failed: $(error_message "$response")")"
+    return 0
+  }
+
+  leave_input workspaces
+  workspace_id="$(jq -r '.result.workspace.workspace_id // empty' <<<"$response" 2>/dev/null)"
+  printf "+%s" "$(refresh_to workspaces "$workspace_id")"
+}
+
+# The close-confirmation header text for workspace $1 — shared by
+# cmd_close_start (entering confirm mode) and cmd_resize (re-deriving
+# whatever header the CURRENT mode should show, without duplicating the
+# "closes the host workspace" wording and risking the two drifting apart —
+# see #R1's own doc comment on cmd_resize for why that drift is a real
+# safety concern here, not just cosmetic).
+close_header() {
+  local target="$1" label count what host
+  label="$(current_name workspaces "$target")"
+  count="$(awk -F'\t' -v id="$target" '$1 == id { print $2; exit }' "$PICKER_DIR/panes.workspaces")"
+  what="${count:-0} pane"
+  [[ "$count" == 1 ]] || what+='s'
+  host="$(cat "$PICKER_DIR/host_workspace" 2>/dev/null || true)"
+  if [[ -n "$host" && "$target" == "$host" ]]; then
+    printf 'closes %s — this also closes Jump (y/n)' "$label"
+  else
+    printf 'close %s and its %s? · y/⏎ close · n/esc keep' "$label" "$what"
+  fi
+}
+
+cmd_close_start() {
+  local target="$1"
+  in_input && return 0
+  [[ "$(current_pane)" == "workspaces" ]] || return 0
+  [[ -n "$target" ]] || return 0
+
+  # Pinned the same way rename is: submit reads this file, never a live {2}.
+  printf '%s\n' "$target" >"$PICKER_DIR/pending_target"
+
+  # Closing the workspace hosting this popup takes the popup's own pane with
+  # it — there is no detach mechanism, so the warning is the only guard.
+  enter_input '✕ ' "$(close_header "$target")"
+  # enter_input parks every bare key; the answer keys come straight back.
+  printf "+rebind(y,n)"
+}
+
+cmd_close_apply() {
+  local target position response
+  target="$(cat "$PICKER_DIR/pending_target" 2>/dev/null || true)"
+
+  if [[ -z "$target" ]]; then
+    leave_input workspaces
+    return 0
+  fi
+
+  if ! response="$("$HERDR" workspace close "$target" 2>&1)"; then
+    printf "%s" "$(action change-header "close failed: $(error_message "$response")")"
+    return 0
+  fi
+
+  # The row is about to disappear; find where it is *now* (not FZF_POS, which
+  # input mode should already keep pinned to this same row, but the id lookup
+  # costs nothing and does not depend on that holding true) so the cursor
+  # lands on the workspace that was below it, clamped to the end of the list.
+  position="${FZF_POS:-}"
+  [[ -n "$position" ]] || position="$(cat "$PICKER_DIR/pos.workspaces" 2>/dev/null || echo 1)"
+
+  leave_input workspaces
+  printf "+%s" "$(refresh_to workspaces "" "$position")"
 }
 
 #######################################################
 # ACTION ENTRYPOINT
 #######################################################
 
+# Runs in herdr's own process, before any popup exists — a failure here has
+# nowhere to print to that the user would see, so it goes to a notification
+# instead (same invocation the checkpoint/laravel-tinker plugins use).
+notify_failure() {
+  "$HERDR" notification show "Jump" --body "$1" >/dev/null 2>&1 || true
+}
+
 cmd_open() {
+  local dep_error snapshot_json ctx host_workspace preflight_file open_status
+
+  if ! dep_error="$(check_deps)"; then
+    notify_failure "$dep_error"
+    return 1
+  fi
+
+  # One snapshot call before asking herdr for a pane: a failure here (herdr
+  # not actually running, socket unreachable, etc.) would otherwise only
+  # surface once render_rows() runs *inside* the freshly opened popup, which
+  # under `set -e` aborts the picker process outright rather than landing on
+  # the "press any key" screen — the popup would just flash open and close.
+  if ! snapshot_json="$("$HERDR" api snapshot 2>&1)"; then
+    notify_failure "$(error_message "$snapshot_json")"
+    return 1
+  fi
+
+  # Which workspace is hosting this popup, so cmd_close_start can warn before
+  # closing it out from under itself — there is no detach mechanism. herdr
+  # gives action entrypoints their invocation context this way (see
+  # laravel-tinker's cmd_open for the same pattern); fall back to whatever the
+  # snapshot itself calls focused, since a popup normally opens over the
+  # focused workspace.
+  ctx="${HERDR_PLUGIN_CONTEXT_JSON:-}"
+  host_workspace=""
+  [[ -n "$ctx" ]] && host_workspace="$(jq -r '.workspace_id // empty' <<<"$ctx" 2>/dev/null || true)"
+  [[ -n "$host_workspace" ]] || host_workspace="$(jq -r '.result.snapshot.focused_workspace_id // empty' \
+    <<<"$snapshot_json" 2>/dev/null || true)"
+
+  # Hand this same snapshot to the picker instead of making it fetch its own:
+  # without this, every open cost two `herdr api snapshot` round trips back
+  # to back (this preflight, then cmd_picker's own first render) for data
+  # that cannot have changed in the handful of milliseconds between them.
+  # cmd_picker consumes and removes this file itself on the happy path.
+  #
+  # R4: preflight_file, once mktemp has created it, is never cleared back to
+  # empty again — only ever removed by that same name. An earlier version
+  # reset the variable to "" the instant the write into it failed, which
+  # dropped the only reference to a file mktemp had already created on disk,
+  # leaking it; every failure path here now removes the file mktemp actually
+  # made, not whatever the variable happens to hold.
+  preflight_file="$(mktemp "${TMPDIR:-/tmp}/herdr-jump-preflight.XXXXXX" 2>/dev/null)" || preflight_file=""
+  if [[ -n "$preflight_file" ]] && ! printf '%s' "$snapshot_json" >"$preflight_file" 2>/dev/null; then
+    rm -f "$preflight_file" 2>/dev/null || true
+    preflight_file=""
+  fi
+
+  open_status=0
   "$HERDR" plugin pane open \
     --plugin "$PLUGIN_ID" \
     --entrypoint picker \
     --placement popup \
-    --width "$(cfg width '90%')" \
-    --height "$(cfg height '60%')" \
-    --focus >/dev/null
+    --width "$(cfg_valid width '90%' valid_dimension)" \
+    --height "$(cfg_valid height '60%' valid_dimension)" \
+    --env "JUMP_HOST_WORKSPACE_ID=$host_workspace" \
+    --env "JUMP_PREFLIGHT_SNAPSHOT=$preflight_file" \
+    --focus >/dev/null || open_status=$?
+
+  if ((open_status != 0)) && [[ -n "$preflight_file" ]]; then
+    rm -f "$preflight_file" 2>/dev/null || true
+  fi
+  return "$open_status"
 }
 
 #######################################################
 # PANE ENTRYPOINT
 #######################################################
 
-build_rows() {
-  local workspaces_json agents_json pane
+# A non-interactive placeholder row for an empty (or filtered-to-empty) pane.
+# Built the same way as a real row — pane name, then every hidden field
+# empty, then the rendered text — so it lines up with --with-nth regardless
+# of how many hidden fields that pane's real rows carry, and its target field
+# (2) is empty like any other: current_name/refresh_to/cmd_key's enter case
+# all already treat an empty target as "nothing to act on".
+placeholder_row() {
+  local pane="$1" text="$2" fields tabs="" i
+  fields="$(display_field "$pane")"
+  for ((i = 1; i < fields; i++)); do tabs+=$'\t'; done
+  printf '%s%s%s  %s%s\n' "$pane" "$tabs" "$C_DIM" "$text" "$C_RESET"
+}
 
-  workspaces_json="$("$HERDR" workspace list)"
-  agents_json="$("$HERDR" agent list)"
+# RPC only: the one `herdr api snapshot` call that is the source of truth
+# for both panes — no separate `workspace list` / `agent list` requests, and
+# no reading herdr's own session.json. Written to
+# $PICKER_DIR/snapshot.json.candidate — never directly to snapshot.json — via
+# its own temp file renamed into place, so the write itself is atomic; on
+# failure nothing on disk changes at all. Prints the failure reason and
+# returns non-zero on failure; prints nothing on success.
+#
+# R3: an earlier version committed straight to snapshot.json here, before
+# render_rows() ever ran against it. Every reader that goes straight to
+# snapshot.json rather than through rows.* — cmd_number, history_target_kind,
+# the scope filter's "current" resolution, current_location_ids, and more —
+# would then see the *new* generation the instant this returned, even while
+# a render failure left rows.*/names.*/panes.* on the *old* one: a jump
+# picked by number, a Ctrl-o comparison, or a scope filter could all be
+# reasoning about a workspace/agent list that didn't match what was on
+# screen. Landing in .candidate defers all of that until refresh_snapshot()
+# below has confirmed a render against it actually works.
+fetch_snapshot() {
+  local snapshot_json tmp
+  if ! snapshot_json="$("$HERDR" api snapshot 2>&1)"; then
+    printf '%s' "$(error_message "$snapshot_json")"
+    return 1
+  fi
+  tmp="$PICKER_DIR/snapshot.json.candidate.tmp.$$"
+  printf '%s' "$snapshot_json" >"$tmp" && mv "$tmp" "$PICKER_DIR/snapshot.json.candidate"
+}
+
+# fetch_snapshot() into a candidate, render_rows() against that candidate,
+# and only once every render pass inside it has actually succeeded, promote
+# the candidate to $PICKER_DIR/snapshot.json — see fetch_snapshot's own doc
+# comment for why the two are not committed as separate, individually-
+# visible steps. render_rows() itself already renders to temp files and only
+# moves rows.*/names.*/panes.* into place once every pass succeeds (see its
+# own doc comment), so by the time this does the final `mv` for
+# snapshot.json, both halves of "the new generation" are ready together; on
+# any failure the candidate is removed and snapshot.json/rows.* are left
+# exactly as they were.
+#
+# For Ctrl-r, and for every caller whose own action (rename, reorder, add,
+# close) just changed server state and needs that reflected. A plain
+# filter/scope cycle or pane switch changes nothing on the server — those
+# call render_rows() directly against the snapshot already on disk instead
+# (see cmd_status_filter, cmd_scope_filter, activate_pane's own
+# scoped-switch rebuild), which used to cost an RPC here as well. Prints
+# whichever step's failure reason and returns non-zero exactly like that step
+# alone would; the caller does not need to know which one it was.
+refresh_snapshot() {
+  local err
+  if ! err="$(fetch_snapshot)"; then
+    printf '%s' "$err"
+    return 1
+  fi
+  if ! err="$(render_rows "$PICKER_DIR/snapshot.json.candidate")"; then
+    rm -f "$PICKER_DIR/snapshot.json.candidate"
+    printf '%s' "$err"
+    return 1
+  fi
+  mv "$PICKER_DIR/snapshot.json.candidate" "$PICKER_DIR/snapshot.json"
+}
+
+# Shared failure cleanup for render_rows()'s temp files, named by this
+# process's own $$ — see render_rows' own doc comment for why they exist.
+render_rows_cleanup() {
+  rm -f "$PICKER_DIR"/*.tmp.$$ 2>/dev/null || true
+}
+
+# Pure rendering from a snapshot file — no RPC of its own. $1, if given, is
+# the path to render from (refresh_snapshot passes its own
+# snapshot.json.candidate here, so a render failure never touches the
+# committed snapshot.json — see R3 on fetch_snapshot's own doc comment);
+# otherwise defaults to $PICKER_DIR/snapshot.json, the already-committed one,
+# for every caller that isn't in the middle of that specific two-step
+# sequence (cmd_status_filter, cmd_scope_filter, activate_pane's own
+# scoped-switch rebuild, cmd_picker's own preflight-snapshot bootstrap).
+# Every jq pass that produces rows.*/names.*/panes.* renders to its own temp
+# file first; only once every one of those passes has actually succeeded are
+# all of them moved into place together (see the commit block below). A
+# mid-render jq failure — a snapshot shape jq cannot parse, say — therefore
+# leaves whatever rows.*/names.*/panes.* were already on disk exactly as
+# they were, rather than truncating them out from under whatever fzf still
+# has on screen (a plain `> file` redirect truncates its target the instant
+# the command starts, whether or not that command goes on to succeed — the
+# reason this used to be able to happen at all). panel.*, the empty-pane
+# placeholder rows, and the once-per-session cursor seed are all derived
+# from rows.* only *after* that commit, so they always describe the same
+# generation of data it does. Prints the failure reason and returns
+# non-zero on failure; prints nothing on success.
+render_rows() {
+  local snapshot_json pane snapshot_path
+
+  snapshot_path="${1:-$PICKER_DIR/snapshot.json}"
+  [[ -s "$snapshot_path" ]] || { printf 'no cached snapshot'; return 1; }
+  snapshot_json="$(cat "$snapshot_path")"
+
+  # Status/scope filters live in their own state files (seeded to "all" by
+  # simply not existing yet) so every rebuild — rename, reorder, Ctrl-r,
+  # cycling the filter itself — re-applies whatever is currently active
+  # without any caller needing to know about it.
+  local status_ws status_ag scope scope_ws
+  status_ws="$(cat "$PICKER_DIR/status_filter.workspaces" 2>/dev/null || echo all)"
+  status_ag="$(cat "$PICKER_DIR/status_filter.agents" 2>/dev/null || echo all)"
+  scope="$(cat "$PICKER_DIR/scope_filter" 2>/dev/null || echo all)"
+  scope_ws=""
+  case "$scope" in
+  current) scope_ws="$(jq -r '.result.snapshot.focused_workspace_id // empty' <<<"$snapshot_json" 2>/dev/null)" ;;
+  highlighted) scope_ws="$(cat "$PICKER_DIR/cursor.workspaces" 2>/dev/null || true)" ;;
+  esac
+
+  # `order = "recent"`: both panes rank a row it has a $HISTORY_FILE entry
+  # for by that entry's recency (index 0 is newest), and every row without
+  # one after all of those, in workspace order — the jq filters below add
+  # that as history's own length plus the row's own workspace-order number,
+  # which is always >= history's length and so always sorts after every
+  # ranked entry while preserving relative order among the unranked ones.
+  # Only read (and only turned into JSON) when the mode actually needs it.
+  local order_mode history_json
+  order_mode="$(cfg_valid order workspace valid_order)"
+  history_json='[]'
+  if [[ "$order_mode" == "recent" && -f "$HISTORY_FILE" ]]; then
+    history_json="$(jq -R -s 'split("\n") | map(select(length > 0))' "$HISTORY_FILE" 2>/dev/null)" || history_json='[]'
+    [[ -n "$history_json" ]] || history_json='[]'
+  fi
+
+  # `clean` runs over every free-text field before it's interpolated: a
+  # literal tab or newline in a terminal title or an agent/workspace name
+  # would otherwise corrupt the TSV row structure it lands in. jq's
+  # Oniguruma engine understands \p{Cc} (the Unicode "control character"
+  # class), which also catches things like a stray bell or escape byte that
+  # \t\n\r alone would miss.
+  #
+  # `status_word` normalizes agent_status to the four real states plus
+  # "none" (herdr reports "unknown" for a workspace with no agent) — the
+  # vocabulary both the `s` filter and the appended free-text search word
+  # use.
+  # Columns width computation for responsive formatting:
+  # Workspace pane width is derived from total cols & pane_ratio (or full width if <100).
+  local cols="${FZF_COLUMNS:-${COLUMNS:-}}"
+  [[ -n "$cols" ]] || cols="$(tput cols 2>/dev/null || echo 100)"
+  
+  local ratio_pct
+  ratio_pct="$(cfg_valid pane_ratio 35 valid_pane_ratio)"
+  
+  local ws_pane_w ag_pane_w
+  if ((cols < 100)); then
+    ws_pane_w="$cols"
+    ag_pane_w="$cols"
+  else
+    ws_pane_w=$(( cols * ratio_pct / 100 ))
+    ((ws_pane_w < 28)) && ws_pane_w=28
+    ag_pane_w=$(( cols - ws_pane_w ))
+  fi
+
+  # Fixed column budget calculations for formatting:
+  # Workspace row: marker(1) + space(1) + number(2) + space(2) + status(1) + space(2) + label + space(2) + count(x) + status_word
+  # Overhead before label = 9 chars; fixed count space right ~8 chars -> max_ws_label = ws_pane_w - 17
+  local max_ws_label=$(( ws_pane_w - 17 ))
+  ((max_ws_label < 8)) && max_ws_label=8
+
+  # Agent row: marker(1) + space(1) + status(1) + space(2) + space_label(fixed) + space(2) + tab_token(fixed 6) + space(2) + identity(name+kind) + space(3) + title
+  # We allocate a fixed truncated width for space_label (~12 cols), fixed token (6 cols)
+  local max_ag_space_label=12
+  local max_ag_title=$(( ag_pane_w - 38 ))
+  ((max_ag_title < 10)) && max_ag_title=10
 
   local jq_icon='
+    def trunc(len): if (length > len) then (if len > 1 then .[0:len-1] + "…" elif len == 1 then "…" else "" end) else . end;
     def icon:
       if   . == "blocked" then $blocked + "●"
       elif . == "working" then $working + "●"
       elif . == "done"    then $finished + "●"
       elif . == "idle"    then $idle + "○"
       else $dim + "·" end + $reset;
-    def here: if . then "▸" else " " end;
+    def here: if . then $accent + "*" + $reset else " " end;
+    def clean: gsub("[\t\n\r\\p{Cc}]"; " ");
+    def status_word: if . == "blocked" or . == "working" or . == "done" or . == "idle" then . else "none" end;
   '
 
   render() {
@@ -332,86 +2351,336 @@ build_rows() {
       --arg finished "$C_DONE" \
       --arg idle "$C_IDLE" \
       --arg dim "$C_DIM" \
+      --arg accent "$C_ACCENT" \
       "$@"
   }
 
-  # Rows are "<pane>\t<focus target>\t<rendered label>"; fzf shows field 3
-  # onward via --with-nth, so the target rides along hidden from display and
-  # from search.
-  render "$jq_icon"'
-    .result.workspaces[]
-    | "workspaces\t\(.workspace_id)\t\(.focused | here) \(.number)  \(.agent_status | icon)  \(.label)  \($dim)\(.pane_count) pane\(if .pane_count == 1 then "" else "s" end)\($reset)"
-  ' <<<"$workspaces_json" >"$PICKER_DIR/rows.workspaces"
+  # See render_rows' own doc comment: every jq pass below lands here first,
+  # and only replaces the real path once every pass has succeeded.
+  local tmp_rows_ws tmp_rows_ag tmp_names_ws tmp_panes_ws tmp_names_ag
+  tmp_rows_ws="$PICKER_DIR/rows.workspaces.tmp.$$"
+  tmp_rows_ag="$PICKER_DIR/rows.agents.tmp.$$"
+  tmp_names_ws="$PICKER_DIR/names.workspaces.tmp.$$"
+  tmp_panes_ws="$PICKER_DIR/panes.workspaces.tmp.$$"
+  tmp_names_ag="$PICKER_DIR/names.agents.tmp.$$"
 
-  # Agents carry a workspace_id but no workspace label, and they arrive in
-  # terminal order, so join against the workspace list to label and sort them.
-  render --argjson ws "$workspaces_json" "$jq_icon"'
-    ($ws.result.workspaces | map({key: .workspace_id, value: .}) | from_entries) as $by_id
-    | .result.agents
-    | map(. + {
-        _order: ($by_id[.workspace_id].number // 9999),
-        _space: ($by_id[.workspace_id].label // .workspace_id)
-      })
-    | sort_by(._order, .pane_id)
+  # Rows are "<pane>\t<focus target>\t<rendered label>"; fzf shows from
+  # display_field() onward via --with-nth, so the hidden fields ride along
+  # out of view and out of search. The status word appended at the end is
+  # NOT hidden — fzf has no way to make a field searchable without also
+  # displaying it once --with-nth is in play (see next_status_filter's
+  # comment) — so it rides along dimmed, the same visual treatment as the
+  # pane count next to it.
+  if ! render --arg status_filter "$status_ws" --arg order_mode "$order_mode" --argjson history "$history_json" \
+    --argjson max_label "$max_ws_label" "$jq_icon"'
+    .result.snapshot.workspaces
+    | map(. as $row | $row + { _rank: (($history | index($row.workspace_id)) as $hidx | ($hidx // (($history | length) + $row.number))) })
+    | (if $order_mode == "recent" then sort_by(._rank) else sort_by(.number) end)
     | .[]
-    | "agents\t\(.pane_id)\t\(.focused | here) \(.agent_status | icon)  \(._space)  \($dim)\(.agent) › \(.terminal_title_stripped)\($reset)"
-  ' <<<"$agents_json" >"$PICKER_DIR/rows.agents"
+    | ((.agent_status // "") | status_word) as $status
+    | select($status_filter == "all" or $status == $status_filter)
+    | (.label | clean) as $full_label
+    | (.number | tostring) as $num_str
+    | (if ($num_str | length) < 2 then " " + $num_str else $num_str end) as $formatted_num
+    | "workspaces\t\(.workspace_id)\t\(.focused | here) \($formatted_num)  \(.agent_status | icon)  \($full_label | trunc($max_label))  \($dim)\(.pane_count) pane\(if .pane_count == 1 then "" else "s" end)\($reset)  \($dim)\($status)\($reset)\(if ($full_label | length) > $max_label then "  " + $dim + $full_label + $reset else "" end)"
+  ' <<<"$snapshot_json" >"$tmp_rows_ws"; then
+    render_rows_cleanup
+    printf 'failed to render workspace rows'
+    return 1
+  fi
+
+  # Agents additionally hide tab_id (used for the jump instead of a separate
+  # `agent get` call), workspace_id, and the tab's own number/label. They
+  # carry a workspace_id but no workspace label and arrive in terminal order,
+  # so join against the workspace and tab lists to label and sort them.
+  # _pane_index is this pane's 1-based position among every pane sharing its
+  # tab_id, taken from snapshot.panes in array order (panes[] carries tab_id
+  # directly — confirmed against a live snapshot; there is no separate
+  # explicit "index within tab" field, so this is what derives one).
+  # $panes_by_tab groups every pane by tab_id once, up front, rather than the
+  # map(select(.tab_id == $a.tab_id)) every agent would otherwise repeat over
+  # the *entire* panes array — group_by is a single stable sort-and-group
+  # pass, so this is one O(panes log panes) instead of O(agents × panes). The
+  # context token is just the tab number ("t2") unless that tab actually has
+  # more than one pane, in which case the pane index is appended ("t2/p3").
+  # A custom name, when set, still shows the underlying agent kind after it,
+  # dimmed, rather than hiding it — inside the object literal itself ($a + {
+  # ... }) rather than `. + { ... }`, because "." inside a filter fed via `|`
+  # (as `$siblings | index(...)` needs) rebinds to whatever was piped in, not
+  # the enclosing object; using $a explicitly throughout sidesteps that.
+  if ! render --arg status_filter "$status_ag" --arg scope "$scope" --arg scope_ws "$scope_ws" \
+    --arg order_mode "$order_mode" --argjson history "$history_json" \
+    --argjson max_space "$max_ag_space_label" --argjson max_title "$max_ag_title" \
+    "$jq_icon"'
+    (.result.snapshot.workspaces | map({key: .workspace_id, value: .}) | from_entries) as $by_ws
+    | (.result.snapshot.tabs | map({key: .tab_id, value: .}) | from_entries) as $by_tab
+    | (.result.snapshot.panes | group_by(.tab_id) | map({key: .[0].tab_id, value: [.[].pane_id]}) | from_entries) as $panes_by_tab
+    | .result.snapshot.agents
+    | map(
+        . as $a
+        | ($panes_by_tab[$a.tab_id] // []) as $siblings
+        | $a + {
+            _order: ($by_ws[$a.workspace_id].number // 9999),
+            _space: (($by_ws[$a.workspace_id].label // $a.workspace_id) | clean),
+            _tab_number: ($by_tab[$a.tab_id].number // 0),
+            _tab_label: (($by_tab[$a.tab_id].label // "") | clean),
+            _pane_count: ($by_tab[$a.tab_id].pane_count // 1),
+            _pane_index: (($siblings | index($a.pane_id)) + 1),
+            _status: (($a.agent_status // "") | status_word),
+            _identity: (if (($a.name // "") != "") then (($a.name | clean) + " \($dim)(" + (($a.agent // "agent") | clean) + ")\($reset)") else (($a.agent // "agent") | clean) end)
+          }
+      )
+    | map(. as $row | $row + { _rank: (($history | index($row.pane_id)) as $hidx | ($hidx // (($history | length) + $row._order))) })
+    | (if $order_mode == "recent" then sort_by(._rank, .pane_id) else sort_by(._order, .pane_id) end)
+    | .[]
+    | select($status_filter == "all" or ._status == $status_filter)
+    | select($scope == "all" or (.workspace_id == $scope_ws))
+    | (.terminal_title_stripped | clean) as $full_title
+    | ("t" + (._tab_number | tostring) + (if ._pane_count > 1 then "/p" + (._pane_index | tostring) else "" end)) as $tok
+    | (if ($tok | length) < 6 then $tok + (" " * (6 - ($tok | length))) else $tok end) as $tok_pad
+    | "agents\t\(.pane_id)\t\(.tab_id)\t\(.workspace_id)\t\(._tab_number)\t\(._tab_label)\t\(.focused | here) \(.agent_status | icon)  \((._space | trunc($max_space)) + (" " * (if (._space | trunc($max_space) | length) < $max_space then $max_space - (._space | trunc($max_space) | length) else 0 end)))  \($dim)\($tok_pad)\($reset)  \(._identity) › \($dim)\($full_title | trunc($max_title))\($reset)  \($dim)\(._status)\($reset)\(if (._space | length) > $max_space then "  " + $dim + ._space + $reset else "" end)\(if ($full_title | length) > $max_title then "  " + $dim + $full_title + $reset else "" end)"
+  ' <<<"$snapshot_json" >"$tmp_rows_ag"; then
+    render_rows_cleanup
+    printf 'failed to render agent rows'
+    return 1
+  fi
+
+  # "<target>\t<current name>" per row, so rename mode can seed the input with
+  # what is there now. Agents without a custom name seed empty rather than with
+  # the detected kind, since that is not a name anyone set. A raw tab/newline
+  # in a label would otherwise break this file's own two-field TSV shape.
+  # Unfiltered by status/scope: renaming/closing only ever act on a currently
+  # visible (so already filtered-in) row, and these are lookup tables keyed
+  # by id, not something the active filter needs to apply to.
+  if ! jq -r '.result.snapshot.workspaces[] | "\(.workspace_id)\t\(.label | gsub("[\t\n\r\\p{Cc}]"; " "))"' \
+    <<<"$snapshot_json" >"$tmp_names_ws"; then
+    render_rows_cleanup
+    printf 'failed to render workspace names'
+    return 1
+  fi
+  # "<workspace>\t<pane count>", so the close prompt can say what goes with it.
+  if ! jq -r '.result.snapshot.workspaces[] | "\(.workspace_id)\t\(.pane_count)"' \
+    <<<"$snapshot_json" >"$tmp_panes_ws"; then
+    render_rows_cleanup
+    printf 'failed to render workspace pane counts'
+    return 1
+  fi
+  if ! jq -r '.result.snapshot.agents[] | "\(.pane_id)\t\((.name // "") | gsub("[\t\n\r\\p{Cc}]"; " "))"' \
+    <<<"$snapshot_json" >"$tmp_names_ag"; then
+    render_rows_cleanup
+    printf 'failed to render agent names'
+    return 1
+  fi
+
+  # Every pass above succeeded — commit all five as one unit, so a reader
+  # never sees, say, freshly rendered rows.workspaces paired with a stale
+  # names.workspaces from the previous generation.
+  mv "$tmp_rows_ws" "$PICKER_DIR/rows.workspaces"
+  mv "$tmp_rows_ag" "$PICKER_DIR/rows.agents"
+  mv "$tmp_names_ws" "$PICKER_DIR/names.workspaces"
+  mv "$tmp_panes_ws" "$PICKER_DIR/panes.workspaces"
+  mv "$tmp_names_ag" "$PICKER_DIR/names.agents"
+
+  # Whether each pane is *ever* non-empty, independent of the active filter —
+  # distinguishes "genuinely nothing here" from "the filter hid everything",
+  # which get different placeholder wording below.
+  local workspaces_total agents_total
+  workspaces_total="$(jq '.result.snapshot.workspaces | length' <<<"$snapshot_json" 2>/dev/null || echo 0)"
+  agents_total="$(jq '.result.snapshot.agents | length' <<<"$snapshot_json" 2>/dev/null || echo 0)"
 
   for pane in workspaces agents; do
     # The inactive pane is rendered into fzf's preview window, which has no
     # --with-nth of its own, so it gets the same rows with the hidden fields cut.
-    cut -f3- <"$PICKER_DIR/rows.$pane" >"$PICKER_DIR/panel.$pane"
+    cut -f"$(display_field "$pane")"- <"$PICKER_DIR/rows.$pane" >"$PICKER_DIR/panel.$pane"
 
     if [[ ! -s "$PICKER_DIR/panel.$pane" ]]; then
-      printf '%s  no %s%s\n' "$C_DIM" "$pane" "$C_RESET" >"$PICKER_DIR/panel.$pane"
-      # An empty focus target makes Enter a no-op rather than an error.
-      printf '%s\t\t%s  no %s%s\n' "$pane" "$C_DIM" "$pane" "$C_RESET" >"$PICKER_DIR/rows.$pane"
+      if [[ "$pane" == "agents" && "$agents_total" == "0" ]]; then
+        printf '%sNo agents detected%s\n%sstart an agent in a workspace to see it here%s\n' \
+          "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" >"$PICKER_DIR/panel.agents"
+        {
+          placeholder_row agents "No agents detected"
+          placeholder_row agents "start an agent in a workspace to see it here"
+        } >"$PICKER_DIR/rows.agents"
+      elif [[ "$pane" == "agents" ]]; then
+        printf '%s  no agents match this filter%s\n' "$C_DIM" "$C_RESET" >"$PICKER_DIR/panel.agents"
+        placeholder_row agents "no agents match this filter" >"$PICKER_DIR/rows.agents"
+      elif [[ "$workspaces_total" == "0" ]]; then
+        printf '%s  no workspaces%s\n' "$C_DIM" "$C_RESET" >"$PICKER_DIR/panel.workspaces"
+        placeholder_row workspaces "no workspaces" >"$PICKER_DIR/rows.workspaces"
+      else
+        printf '%s  no workspaces match this filter%s\n' "$C_DIM" "$C_RESET" >"$PICKER_DIR/panel.workspaces"
+        placeholder_row workspaces "no workspaces match this filter" >"$PICKER_DIR/rows.workspaces"
+      fi
     fi
 
-    # 1-based row of whatever is focused now, so each pane opens on the cursor
-    # instead of snapping to the top.
-    grep -n $'\t▸' "$PICKER_DIR/rows.$pane" | head -1 | cut -d: -f1 >"$PICKER_DIR/pos.$pane" || true
-    [[ -s "$PICKER_DIR/pos.$pane" ]] || echo 1 >"$PICKER_DIR/pos.$pane"
+    # Cursor/query state is seeded once, on the very first build. Later
+    # rebuilds (rename, add, close, reorder, filter cycling, refresh) leave
+    # both panes' saved state alone: the action's own pane gets pointed at
+    # its target explicitly (refresh_to, cmd_move), and the pane that was not
+    # touched keeps whatever position the user actually left it at, rather
+    # than snapping back to whatever the session considers focused.
+    if [[ ! -f "$PICKER_DIR/pos.$pane" ]]; then
+      local focused_id
+      if [[ "$pane" == "workspaces" ]]; then
+        focused_id="$(jq -r '.result.snapshot.focused_workspace_id // empty' <<<"$snapshot_json" 2>/dev/null || true)"
+      else
+        focused_id="$(jq -r '
+          .result.snapshot.focused_pane_id as $pane
+          | .result.snapshot.focused_tab_id as $tab
+          | ([.result.snapshot.agents[]? | select(.pane_id == $pane) | .pane_id][0]
+             // [.result.snapshot.agents[]? | select(.tab_id == $tab) | .pane_id][0]
+             // empty)' <<<"$snapshot_json" 2>/dev/null || true)"
+      fi
+      printf '%s' "$focused_id" >"$PICKER_DIR/cursor.$pane"
+      echo 1 >"$PICKER_DIR/pos.$pane"
+      : >"$PICKER_DIR/query.$pane"
+      printf 'normal' >"$PICKER_DIR/search_mode.$pane"
+    fi
   done
 }
 
 cmd_picker() {
-  local tool
-  for tool in "$HERDR" fzf jq; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      echo "jump: $tool not found on PATH" >&2
-      read -rsn 1 -p "press any key to close"
-      return 1
-    fi
-  done
+  # R4: registered before check_deps, and before PICKER_DIR itself exists,
+  # so a missing dependency below does not leak the handoff file cmd_open's
+  # own preflight left behind. An earlier version only ever consumed/removed
+  # it deep inside the snapshot-bootstrap block further down, well after
+  # this early-return path — this trap must not reference $PICKER_DIR (it
+  # does not exist yet, and `set -u` is active), only the handoff file.
+  trap '[[ -n "${JUMP_PREFLIGHT_SNAPSHOT:-}" ]] && rm -f "$JUMP_PREFLIGHT_SNAPSHOT" 2>/dev/null' EXIT
 
-  local tmp start other side colors selection pane target
+  local dep_error
+  if ! dep_error="$(check_deps)"; then
+    echo "jump: $dep_error" >&2
+    read -rsn 1 -p "press any key to close"
+    return 1
+  fi
+
+  local tmp start other side colors selection pane target tab_id rest
   tmp="${TMPDIR:-/tmp}"
   PICKER_DIR="$(mktemp -d "${tmp%/}/herdr-jump.XXXXXX")"
   export PICKER_DIR
-  trap 'rm -rf "$PICKER_DIR"' EXIT
+  trap 'rm -rf "$PICKER_DIR"; [[ -n "${JUMP_PREFLIGHT_SNAPSHOT:-}" ]] && rm -f "$JUMP_PREFLIGHT_SNAPSHOT" 2>/dev/null' EXIT
 
-  build_rows
+  # Resolve and export every setting, SELF_Q and the session-key paths
+  # exactly once for this picker session — see freeze_settings' own doc
+  # comment for why every cfg_valid call it makes is trustworthy even if an
+  # external caller's environment already had a same-named JUMP_CFG_* in it.
+  freeze_settings
 
-  start="$(cfg start_pane workspaces)"
-  [[ "$start" == "agents" ]] || start="workspaces"
+  # Set once by cmd_open via --env (herdr propagates it into this process'
+  # environment); persisted to the state dir since every --key invocation
+  # after this one is a separate process and only inherits the environment,
+  # not this shell's variables — reading it back from a file here just keeps
+  # all of the picker's cross-process state in one place.
+  printf '%s' "${JUMP_HOST_WORKSPACE_ID:-}" >"$PICKER_DIR/host_workspace"
+  help_text >"$PICKER_DIR/help.txt"
+
+  # cmd_open, if that is who launched this popup, already paid for one
+  # `herdr api snapshot` call as its own preflight and left it here for us —
+  # reuse it instead of a second RPC for data that cannot have changed in the
+  # handful of milliseconds since. Consumed and removed unconditionally (a
+  # stray leftover file is worse than one avoided RPC, and the EXIT trap
+  # above is only a backstop for the early-return paths before this point,
+  # not a substitute for removing it here). Renders into the same
+  # snapshot.json.candidate → snapshot.json handoff refresh_snapshot() uses
+  # (see fetch_snapshot's own doc comment, R3): a corrupt or truncated
+  # preflight file is discovered here, before anything commits, and falls
+  # through to the normal refresh_snapshot() path below rather than wedging
+  # the picker on the one thing meant to speed it up.
+  local build_error used_preflight=0
+  if [[ -n "${JUMP_PREFLIGHT_SNAPSHOT:-}" ]]; then
+    if [[ -s "$JUMP_PREFLIGHT_SNAPSHOT" ]] && cp "$JUMP_PREFLIGHT_SNAPSHOT" "$PICKER_DIR/snapshot.json.candidate" 2>/dev/null; then
+      if build_error="$(render_rows "$PICKER_DIR/snapshot.json.candidate")"; then
+        mv "$PICKER_DIR/snapshot.json.candidate" "$PICKER_DIR/snapshot.json"
+        used_preflight=1
+      else
+        rm -f "$PICKER_DIR/snapshot.json.candidate"
+      fi
+    fi
+    rm -f "$JUMP_PREFLIGHT_SNAPSHOT" 2>/dev/null || true
+  fi
+  if ((! used_preflight)); then
+    if ! build_error="$(refresh_snapshot)"; then
+      echo "jump: $build_error" >&2
+      read -rsn 1 -p "press any key to close"
+      return 1
+    fi
+  fi
+
+  # "At load", per the doc comment on history_prune: once, right after the
+  # first snapshot of this picker session is in hand, not on every rebuild.
+  history_prune "$PICKER_DIR/snapshot.json"
+
+  # Where focus is *right now*, before this session's own jump (if any) moves
+  # it — see record_jump()'s own doc comment for why this, not a bare
+  # history_record on the destination alone, is what lets Ctrl-o return here
+  # afterward.
+  printf '%s' "$(current_location_id "$(cat "$PICKER_DIR/snapshot.json")")" >"$PICKER_DIR/origin"
+
+  start="$(cfg_valid start_pane workspaces valid_pane_name)"
+  # A configured `start_pane = agents` with nothing to show there yet would
+  # just open on an inert placeholder; workspaces always has something.
+  if [[ "$start" == "agents" && ! -s "$PICKER_DIR/names.agents" ]]; then
+    start="workspaces"
+  fi
   other="$(other_pane "$start")"
   side="$(pane_side "$start")"
+
+  # remember_query: pull each pane's last query back from $QUERY_PREFIX (see
+  # cmd_focus) over the blank one render_rows just seeded. Only the start
+  # pane's needs to reach fzf's own --query flag below; the other pane's
+  # query.$other file is what activate_pane reads if the user switches there.
+  local start_query=""
+  if [[ "$(cfg_valid remember_query false valid_bool)" == "true" ]]; then
+    [[ -f "$QUERY_PREFIX.$start" ]] && cp "$QUERY_PREFIX.$start" "$PICKER_DIR/query.$start" 2>/dev/null
+    [[ -f "$QUERY_PREFIX.$other" ]] && cp "$QUERY_PREFIX.$other" "$PICKER_DIR/query.$other" 2>/dev/null
+    start_query="$(cat "$PICKER_DIR/query.$start" 2>/dev/null || true)"
+  fi
+  if [[ "$(cfg_valid search_first false valid_bool)" == "true" ]]; then
+    printf 'search' >"$PICKER_DIR/search_mode.$start"
+  fi
+
+  local preview_on preview_args ratio_pct
+  if effective_preview; then preview_on="true"; else preview_on="false"; fi
+  ratio_pct="$(cfg_valid pane_ratio 35 valid_pane_ratio)"
+
+  # Same inversion as activate_pane: ratio_pct sizes the preview side.
+  if [[ "$start" == "workspaces" ]]; then
+    ratio_pct=$((100 - ratio_pct))
+  fi
+
+  preview_args=()
+  if [[ "$preview_on" == "true" ]]; then
+    preview_args=(
+      --preview="cat $(shq "$PICKER_DIR/panel.$other")"
+      --preview-window="$side,${ratio_pct}%,border-rounded"
+      --preview-label=" $(pane_label "$other") "
+    )
+  else
+    preview_args=(
+      --preview="cat $(shq "$PICKER_DIR/panel.$other")"
+      --preview-window="hidden"
+    )
+  fi
 
   # Only the accent-carrying elements are overridden; everything else stays on
   # fzf's own defaults or the terminal background so the popup inherits the
   # user's theme.
-  colors="bg:-1,gutter:-1,fg:-1,hl:$(cfg accent 6),hl+:$(cfg accent 6)"
-  colors+=",pointer:$(cfg accent 6),prompt:$(cfg accent 6),label:$(cfg accent 6)"
-  colors+=",border:$(cfg dim 8),header:$(cfg dim 8),info:$(cfg dim 8)"
+  colors="bg:-1,gutter:-1,fg:-1,hl:$(cfg_valid accent 6 valid_color),hl+:$(cfg_valid accent 6 valid_color)"
+  colors+=",pointer:$(cfg_valid accent 6 valid_color),prompt:$(cfg_valid accent 6 valid_color)"
+  colors+=",label:$(cfg_valid accent 6 valid_color),preview-label:$(cfg_valid dim 8 valid_color)"
+  colors+=",border:$(cfg_valid dim 8 valid_color),header:$(cfg_valid dim 8 valid_color),info:$(cfg_valid dim 8 valid_color)"
 
-  # Esc or ctrl-c leaves fzf non-zero; that is a cancel, not a failure.
+  local fzf_status=0
+  # Ignore fzf's provisional first-row focus callback until the initial load
+  # handler has restored the snapshot-derived cursor id.
+  : >"$PICKER_DIR/transitioning"
   selection="$(fzf \
     --ansi \
     --delimiter=$'\t' \
-    --with-nth='3..' \
+    --with-nth="$(with_nth_for "$start")" \
     --layout=reverse \
-    --info=hidden \
+    --info=inline-right \
     --no-separator \
     --no-multi \
     --cycle \
@@ -423,41 +2692,101 @@ cmd_picker() {
     --margin=0 \
     --padding='0,1' \
     --prompt='❯ ' \
+    --query="$start_query" \
     --pointer='❯' \
     --gutter=' ' \
     --header="$(header_for "$start")" \
     --color="$colors" \
     --list-border=rounded \
-    --list-label=" $start " \
-    --preview="cat '$PICKER_DIR/panel.$other'" \
-    --preview-window="$side,50%,border-rounded" \
-    --preview-label=" $other " \
-    --bind="load:pos($(cat "$PICKER_DIR/pos.$start"))+unbind(load)" \
+    --list-label=" $(pane_label "$start") " \
+    "${preview_args[@]}" \
+    --bind="start:transform($SELF_Q --key startup)" \
+    --bind="load:transform($SELF_Q --key load {2})" \
+    --bind="focus:execute-silent($SELF_Q --key focus {2})" \
+    --bind="change:execute-silent($SELF_Q --key query)" \
+    --bind="resize:transform($SELF_Q --key resize)" \
     --bind='j:down,k:up,ctrl-n:down,ctrl-p:up' \
-    --bind='ctrl-d:half-page-down,ctrl-u:half-page-up' \
+    --bind="ctrl-d:half-page-down,ctrl-u:transform($SELF_Q --key ctrl-u)" \
     --bind='g:first,G:last,q:abort' \
-    --bind="h:transform('$SELF' --key workspaces)" \
-    --bind="l:transform('$SELF' --key agents)" \
-    --bind="tab:transform('$SELF' --key toggle)" \
-    --bind="K:transform('$SELF' --key move-up {2})" \
-    --bind="J:transform('$SELF' --key move-down {2})" \
-    --bind="/:transform('$SELF' --key search)" \
-    --bind="esc:transform('$SELF' --key escape)" \
-    <"$PICKER_DIR/rows.$start")" || return 0
+    --bind="h:transform($SELF_Q --key workspaces)" \
+    --bind="l:transform($SELF_Q --key agents)" \
+    --bind="tab:transform($SELF_Q --key toggle)" \
+    --bind="shift-tab:transform($SELF_Q --key toggle)" \
+    --bind="K:transform($SELF_Q --key move-up {2})" \
+    --bind="J:transform($SELF_Q --key move-down {2})" \
+    --bind="/:transform($SELF_Q --key search)" \
+    --bind="r:transform($SELF_Q --key rename {2})" \
+    --bind="f2:transform($SELF_Q --key rename {2})" \
+    --bind="a:transform($SELF_Q --key add)" \
+    --bind="d:transform($SELF_Q --key close {2})" \
+    --bind="y:transform($SELF_Q --key yes)" \
+    --bind="n:transform($SELF_Q --key no)" \
+    --bind="s:transform($SELF_Q --key status)" \
+    --bind="w:transform($SELF_Q --key scope)" \
+    --bind="o:transform($SELF_Q --key agent-preview)" \
+    --bind="?:transform($SELF_Q --key help)" \
+    --bind="ctrl-r:transform($SELF_Q --key refresh)" \
+    --bind="ctrl-o:transform($SELF_Q --key previous)" \
+    --bind="1:transform($SELF_Q --key number 1)" \
+    --bind="2:transform($SELF_Q --key number 2)" \
+    --bind="3:transform($SELF_Q --key number 3)" \
+    --bind="4:transform($SELF_Q --key number 4)" \
+    --bind="5:transform($SELF_Q --key number 5)" \
+    --bind="6:transform($SELF_Q --key number 6)" \
+    --bind="7:transform($SELF_Q --key number 7)" \
+    --bind="8:transform($SELF_Q --key number 8)" \
+    --bind="9:transform($SELF_Q --key number 9)" \
+    --bind="enter:transform($SELF_Q --key enter {2})" \
+    --bind="esc:transform($SELF_Q --key escape)" \
+    <"$PICKER_DIR/rows.$start")" || fzf_status=$?
 
-  IFS=$'\t' read -r pane target _ <<<"$selection"
-  [[ -n "${target:-}" ]] || return 0
+  # fzf's exit codes distinguish a real problem from a plain cancel: 130 is
+  # Esc/ctrl-c, 1 is "no match" (unreachable here — --disabled starts with
+  # everything showing — but harmless if it ever happens), and anything else
+  # (2: option/runtime error, 126/127: couldn't even run it) is worth telling
+  # the user about instead of just closing the popup on them.
+  if ((fzf_status != 0)); then
+    if ((fzf_status == 130 || fzf_status == 1)); then
+      return 0
+    fi
+    echo "jump: fzf exited with an error (status $fzf_status)" >&2
+    read -rsn 1 -p "press any key to close"
+    return 1
+  fi
+
+  # Plain `IFS=$'\t' read` collapses consecutive tabs, because tab is "IFS
+  # whitespace" — the empty-target placeholder row (pane<TAB><TAB>text) would
+  # lose its empty field 2 and read "text" back as the target. Parameter
+  # expansion splits on each literal tab instead, preserving empty fields.
+  pane="${selection%%$'\t'*}"
+  rest="${selection#*$'\t'}"
+  target="${rest%%$'\t'*}"
+  tab_id=""
+  if [[ "$pane" == "agents" ]]; then
+    rest="${rest#*$'\t'}"
+    tab_id="${rest%%$'\t'*}"
+  fi
+
+  [[ -n "$target" ]] || return 0
   [[ "$pane" == "workspaces" || "$pane" == "agents" ]] || return 0
 
   # The popup closes the moment this command exits, so a failure has to hold
   # the screen or the error scrolls past before it can be read.
-  local response message
-  if ! response="$(jump_to "$pane" "$target" 2>&1)"; then
+  local response message jump_status
+  jump_status=0
+  response="$(jump_to "$pane" "$target" "$tab_id" 2>&1)" || jump_status=$?
+  if ((jump_status != 0)); then
     message="$(jq -r '.error.message // empty' <<<"$response" 2>/dev/null || true)"
-    echo "jump: ${message:-$response}" >&2
+    if ((jump_status == 3)); then
+      echo "jump: ${message:-${response:-tab focused, exact pane unavailable}}" >&2
+    else
+      echo "jump: ${message:-$response}" >&2
+    fi
     read -rsn 1 -p "press any key to close"
-    return 1
+    return "$jump_status"
   fi
+
+  record_jump "$target"
 }
 
 case "${1:-}" in
